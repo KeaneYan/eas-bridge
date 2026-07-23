@@ -1,0 +1,128 @@
+# Copyright (C) 2026 Henry Stern
+# SPDX-License-Identifier: MIT
+
+name: Bug report
+description: Something the library does (or doesn't do) when talking to a real EAS server.
+labels: [bug, triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing! Please answer the questions below — the EAS
+        protocol surface is huge and behaviour varies sharply between
+        server vendors and protocol versions, so the more context the
+        less round-tripping we'll need.
+
+        For **security issues**, follow [SECURITY.md](../security/policy)
+        instead of filing publicly.
+
+  - type: input
+    id: lib-version
+    attributes:
+      label: go-activesync version
+      description: The git tag, commit SHA, or `go list -m github.com/hstern/go-activesync`.
+      placeholder: "v0.1.0  /  abc1234  /  v0.0.0-20260510123456-abc1234"
+    validations:
+      required: true
+
+  - type: input
+    id: go-version
+    attributes:
+      label: Go version
+      description: Output of `go version`.
+      placeholder: "go version go1.26.3 darwin/amd64"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: server
+    attributes:
+      label: EAS server
+      multiple: false
+      options:
+        - Z-Push
+        - SOGo
+        - Microsoft Exchange (on-prem)
+        - Microsoft Exchange Online / Office 365
+        - grommunio
+        - other / unknown
+    validations:
+      required: true
+
+  - type: input
+    id: server-version
+    attributes:
+      label: Server version (and backend, if Z-Push)
+      placeholder: "Z-Push 2.7.6 / BackendIMAP via Dovecot 2.3.21"
+
+  - type: dropdown
+    id: protocol-version
+    attributes:
+      label: EAS protocol version negotiated
+      description: Either what `Client.NegotiateVersion` returned, or what you set on `Config.ASVersion`.
+      multiple: false
+      options:
+        - "14.1"
+        - "14.0"
+        - "12.1"
+        - "12.0"
+        - "16.1"
+        - "16.0"
+        - "unknown"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: auth-scheme
+    attributes:
+      label: Auth scheme
+      multiple: false
+      options:
+        - Basic
+        - Bearer (OAuth)
+        - NTLM
+        - Negotiate / SPNEGO (Kerberos)
+        - mTLS
+        - other / multiple
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: The actual behaviour. Paste the error message verbatim if there was one.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: |
+        A minimal Go snippet that triggers the issue, ideally one we can
+        run against the [`testenv/`](../tree/main/testenv) Docker stack.
+        If credentials/server names are sensitive, redact them but keep
+        the call shape.
+      render: go
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Debug logs
+      description: |
+        Output with `slog` set to `LevelDebug` is gold (set
+        `Config.Logger = slog.New(slog.NewTextHandler(os.Stderr,
+        &slog.HandlerOptions{Level: slog.LevelDebug}))`). Trim
+        credentials.
+      render: text

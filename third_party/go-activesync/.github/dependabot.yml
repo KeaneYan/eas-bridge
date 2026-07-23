@@ -1,0 +1,36 @@
+# Copyright (C) 2026 Henry Stern
+# SPDX-License-Identifier: MIT
+
+version: 2
+updates:
+  # Go module dependencies. We pull in third-party crypto / auth libs
+  # (gokrb5, ntlmssp, pkcs7, pkcs8) that ship CVEs occasionally; this
+  # is the standing alarm. Weekly is fine — daily would be noisy for a
+  # small project.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      # Group all minor + patch bumps into one PR per week to keep the
+      # noise down. Major bumps still come as individual PRs because
+      # they may be breaking.
+      go-minor-and-patch:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: deps
+
+  # GitHub Actions versions used in .github/workflows/*.yml.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    groups:
+      ga-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci(deps)

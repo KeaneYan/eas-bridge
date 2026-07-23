@@ -1,0 +1,11 @@
+# Copyright (C) 2026 Henry Stern
+# SPDX-License-Identifier: MIT
+
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/hstern/go-activesync/security/advisories/new
+    about: Please report security issues privately, not as public issues. See SECURITY.md.
+  - name: Question or discussion
+    url: https://github.com/hstern/go-activesync/discussions
+    about: Open-ended questions and design discussion belong in Discussions.

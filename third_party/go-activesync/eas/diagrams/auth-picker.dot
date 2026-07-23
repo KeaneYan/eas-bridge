@@ -1,0 +1,36 @@
+// Copyright (C) 2026 Henry Stern
+// SPDX-License-Identifier: MIT
+
+// Auth-scheme decision tree. Each leaf shows what to set on eas.Config
+// (or wrap on the *http.Client.Transport) for that scheme.
+// Render: dot -Tsvg auth-picker.dot -o auth-picker.svg
+digraph auth_picker {
+    rankdir=TB;
+    bgcolor="white";
+    node [fontname="Helvetica", fontsize=11, shape=box, style="rounded,filled", fillcolor="#cfe2f3"];
+    edge [fontname="Helvetica", fontsize=10];
+
+    q0 [label="Where do credentials live?", shape=diamond, fillcolor="#fff2cc"];
+
+    q1 [label="Static, set per process?", shape=diamond, fillcolor="#fff2cc"];
+    q2 [label="Server requires\nclient certificate?", shape=diamond, fillcolor="#fff2cc"];
+
+    basic   [label="Basic\n\nConfig.Username = \"u\"\nConfig.Password = \"…\"\n(default; pre-built header)", fillcolor="#d9ead3"];
+    bearer  [label="Bearer (OAuth)\n\nConfig.AuthHeader = func(ctx) (string, error)\nConfig.RetryOn401 = true", fillcolor="#d9ead3"];
+    ntlm    [label="NTLM (legacy on-prem)\n\ncfg.HTTPClient.Transport =\n  ntlmssp.Negotiator{RoundTripper: base}\n\nUsername in DOMAIN\\\\user form", fillcolor="#d9ead3"];
+    spnego  [label="Negotiate / SPNEGO (Kerberos)\n\ncfg.HTTPClient.Transport =\n  spnegoRoundTripper{client, spn}\n\nUses keytab or kinit ccache", fillcolor="#d9ead3"];
+    mtls    [label="mTLS (client cert)\n\ncfg.HTTPClient.Transport =\n  &http.Transport{TLSClientConfig:\n    &tls.Config{Certificates: []tls.Certificate{…}}}", fillcolor="#d9ead3"];
+
+    q0 -> q2 [label="cert"];
+    q2 -> mtls [label="yes"];
+    q2 -> q1   [label="no"];
+
+    q1 -> basic  [label="username + password"];
+    q1 -> bearer [label="short-lived token\n(refreshes during session)"];
+    q1 -> ntlm   [label="Windows domain account\n(legacy Exchange / IIS)"];
+    q1 -> spnego [label="Kerberos ticket\n(AD-joined env)"];
+
+    note [shape=note, fillcolor="#fff2cc", fontsize=10,
+          label="mTLS combines with any Authorization scheme:\nthe TLS handshake presents a cert; the\nHTTP layer still does Basic/Bearer/etc."];
+    mtls -> note [style=dashed, arrowhead=none, color="#888888"];
+}

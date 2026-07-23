@@ -1,0 +1,27 @@
+// Copyright (C) 2026 Henry Stern
+// SPDX-License-Identifier: MIT
+
+// Per-folder Sync key state machine. SyncEmail walks NoKey → Bootstrapped →
+// Synced transparently in one call (set NoBootstrap to observe each step).
+// Render: dot -Tsvg sync-state.dot -o sync-state.svg
+digraph sync_state {
+    rankdir=LR;
+    bgcolor="white";
+    node [fontname="Helvetica", fontsize=11, shape=ellipse, style="filled", fillcolor="#cfe2f3"];
+    edge [fontname="Helvetica", fontsize=10];
+
+    nokey       [label="NoKey\n(SyncKey = \"0\")", fillcolor="#fce5cd"];
+    bootstrapped [label="Bootstrapped\n(server-issued key,\nno items yet)"];
+    synced      [label="Synced\n(items flowing)", fillcolor="#d9ead3"];
+
+    nokey -> bootstrapped [label="Sync(key=\"0\")\nreturns NewKey,\n0 items"];
+    bootstrapped -> synced [label="Sync(key=NewKey)\nreturns initial batch"];
+    synced -> synced [label="Sync(key=Last)\nreturns delta;\nadvances key"];
+
+    synced -> nokey [label="Status=3 InvalidSyncKey\n(server reset state)\n→ key cleared, retry once", color="#cc0000", fontcolor="#cc0000"];
+    bootstrapped -> nokey [label="Status=3", color="#cc0000", fontcolor="#cc0000", style=dashed];
+
+    note [shape=note, fillcolor="#fff2cc", fontsize=10,
+          label="SyncEmail() walks the bootstrap (NoKey → Bootstrapped → Synced)\nin one call by default. Pass NoBootstrap: true to do exactly one\nround-trip — useful in tests and for streaming clients that want\nto observe each batch."];
+    synced -> note [style=invis];
+}

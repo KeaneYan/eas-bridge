@@ -1,0 +1,41 @@
+# Copyright (C) 2026 Henry Stern
+# SPDX-License-Identifier: MIT
+
+name: Feature request
+description: Propose new functionality or an API change.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: The user-facing pain point — not the proposed implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed API / behaviour
+      description: |
+        What would the call look like from a user's code? If it touches the
+        EAS wire format, point at the relevant MS-ASCMD / MS-ASPROV / etc.
+        section.
+      render: go
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you've considered
+      description: Workarounds or related libraries you tried first.
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Which package?
+      multiple: true
+      options:
+        - eas
+        - wbxml
+        - testenv
+        - tooling (Makefile / CI / docs)

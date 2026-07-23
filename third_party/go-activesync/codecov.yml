@@ -1,0 +1,33 @@
+# Codecov repo-level config.
+#
+# Declares the flags ci.yml uploads under so they show up in the Tests
+# page even before a successful processing run, and turns on flag
+# carryforward so per-flag coverage / test-result data persists across
+# pushes that didn't re-run that suite (e.g. integration only runs on
+# main/PR, so feature-branch pushes carry the previous integration
+# numbers forward instead of going blank).
+
+flag_management:
+  default_rules:
+    carryforward: true
+  individual_flags:
+    - name: unittests
+      paths:
+        - "wbxml/"
+        - "eas/"
+    - name: integration
+      paths:
+        - "eas/"
+
+# Coverage thresholds. We don't fail PRs on coverage drops yet; this
+# section just sets the project / patch baselines Codecov reports.
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 0.5%
+    patch:
+      default:
+        target: 80%
+        threshold: 5%

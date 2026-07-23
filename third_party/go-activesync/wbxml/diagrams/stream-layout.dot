@@ -1,0 +1,30 @@
+// Copyright (C) 2026 Henry Stern
+// SPDX-License-Identifier: MIT
+
+// WBXML 1.3 stream layout — header followed by body. EAS profile.
+// Render: dot -Tsvg stream-layout.dot -o stream-layout.svg
+digraph stream {
+    rankdir=TB;
+    bgcolor="white";
+    node [fontname="Helvetica", fontsize=10];
+    edge [fontname="Helvetica", fontsize=9];
+
+    // Header — fixed prefix on every WBXML document.
+    header [shape=record, style=filled, fillcolor="#cfe2f3",
+            label="{HEADER (4+ bytes)|{ version\n0x03 (1.3) | public ID\n0x01 (unknown) | charset\n0x6A (UTF-8) | string table\n0x00 (empty) }}"];
+
+    // Body — a stream of tag tokens with optional content.
+    body [shape=record, style=filled, fillcolor="#d9ead3",
+          label="{BODY (one root element + descendants)|{ SWITCH_PAGE 0x00 | page byte\n(0..24) | TAG byte\nC-flag + id | ... children ... | END 0x01 | TAG byte | ... | END 0x01 | ...}}"];
+
+    // Token reference card.
+    tokens [shape=record, style="filled,dashed", fillcolor="#fff2cc", fontsize=9,
+            label="{Global tokens (any active page)|{ 0x00 SWITCH_PAGE \\| 0x01 END \\| 0x03 STR_I (NUL-terminated UTF-8) \\| 0xC3 OPAQUE (mb_u_int32 length, raw bytes) }}"];
+
+    note [shape=note, fillcolor="#fff2cc", fontsize=10,
+          label="EAS uses a tiny subset of WBXML.\nNo attributes, no LITERAL family,\nno string-table refs, no PI."];
+
+    header -> body [label="byte stream\ncontinues"];
+    body -> tokens [style=dashed, arrowhead=none, color="#888888", label="reference"];
+    tokens -> note [style=dashed, arrowhead=none, color="#888888"];
+}

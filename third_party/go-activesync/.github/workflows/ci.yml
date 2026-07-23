@@ -1,0 +1,220 @@
+# Copyright (C) 2026 Henry Stern
+# SPDX-License-Identifier: MIT
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+# Cancel in-flight runs of the same workflow on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ------------------------------------------------------------------------
+  # Static checks: gofmt, vet, go mod tidy delta, govulncheck.
+  # Fast (~30s), runs on every push.
+  # ------------------------------------------------------------------------
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          # Track the latest 1.26 patch automatically so security fixes
+          # land in CI without needing to bump go.mod every patch release.
+          go-version: '1.26'
+          check-latest: true
+          cache: true
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "::error::gofmt drift in:"
+            echo "$out"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go mod tidy is clean
+        run: |
+          go mod tidy
+          if ! git diff --exit-code -- go.mod go.sum; then
+            echo "::error::go.mod/go.sum out of sync; run 'go mod tidy'"
+            exit 1
+          fi
+
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  # ------------------------------------------------------------------------
+  # Unit tests with race detector + coverage. Always runs.
+  # ------------------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          # Track the latest 1.26 patch automatically so security fixes
+          # land in CI without needing to bump go.mod every patch release.
+          go-version: '1.26'
+          check-latest: true
+          cache: true
+
+      - name: build
+        run: go build ./...
+
+      # gotestsum wraps `go test` and emits JUnit XML alongside the
+      # standard Go output. Codecov's test-results-action ingests that
+      # JUnit file for Test Analytics (flaky-test detection, per-test
+      # duration trends) — a separate product from coverage.
+      - name: install gotestsum
+        run: go install gotest.tools/gotestsum@latest
+
+      - name: test (race + coverage + junit)
+        run: |
+          gotestsum \
+            --junitfile junit.xml \
+            --junitfile-project-name=go-activesync \
+            --junitfile-testsuite-name=short \
+            --junitfile-testcase-classname=short \
+            -- -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+
+      # Surface the JUnit XML as an artifact so we can debug Codecov
+      # parser behavior without re-running CI. Drop this once the
+      # Tests page is reliably populated.
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: junit
+          path: junit.xml
+          if-no-files-found: error
+
+      - name: coverage summary
+        run: go tool cover -func=coverage.out | tail -5
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: error
+
+      # Codecov now requires a token even on public repos for reliable
+      # ingestion. CODECOV_TOKEN is set as a repository secret. Failures
+      # stay non-fatal so a codecov.io outage doesn't break the build.
+      - uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage.out
+          flags: unittests
+          fail_ci_if_error: false
+
+      # Test Analytics: upload junit.xml even when tests fail so flaky
+      # / consistently-failing tests show up in Codecov dashboards.
+      # codecov/test-results-action is the only action that correctly
+      # invokes `codecovcli do-upload --report-type test_results` under
+      # the hood — codecov-action's `report_type: test_results` input
+      # silently routes the upload through the coverage pipeline
+      # (upload-coverage), which drops JUnit data. The action emits a
+      # deprecation banner pointing at codecov-action@v5+; ignore it
+      # until the unified action's test-results path actually works.
+      # The Codecov docs claim v5 of this action exists but the repo
+      # only publishes up to v1.2.1, so we pin to the v1 major tag.
+      - uses: codecov/test-results-action@v1
+        if: ${{ !cancelled() }}
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./junit.xml
+          flags: unittests
+          fail_ci_if_error: false
+
+  # ------------------------------------------------------------------------
+  # Integration tests against a live Z-Push container. Brings up the
+  # testenv/ Docker stack, runs `go test -tags integration`, tears down.
+  # Slow (~3 min) — runs on push to main and on pull_request, not on
+  # every branch push to keep iteration fast.
+  # ------------------------------------------------------------------------
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          # Track the latest 1.26 patch automatically so security fixes
+          # land in CI without needing to bump go.mod every patch release.
+          go-version: '1.26'
+          check-latest: true
+          cache: true
+
+      - name: build & start testenv
+        working-directory: testenv
+        run: |
+          docker compose up --build -d
+          for i in $(seq 1 90); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' go-activesync-zpush 2>/dev/null || echo missing)
+            echo "[$i] healthcheck=$status"
+            if [ "$status" = "healthy" ]; then break; fi
+            sleep 2
+          done
+          if [ "$status" != "healthy" ]; then
+            echo "::group::container logs"
+            docker compose logs
+            echo "::endgroup::"
+            exit 1
+          fi
+
+      - name: install gotestsum
+        run: go install gotest.tools/gotestsum@latest
+
+      - name: integration tests
+        env:
+          EAS_INTEGRATION_URL: http://localhost:8580/Microsoft-Server-ActiveSync
+          EAS_INTEGRATION_USER: integration
+          EAS_INTEGRATION_PASS: integration
+          EAS_INTEGRATION_DEVICE: integration00000000000000000000
+          EAS_INTEGRATION_VERSION: "14.0"
+        run: |
+          gotestsum \
+            --junitfile junit-integration.xml \
+            --junitfile-project-name=go-activesync \
+            --junitfile-testsuite-name=short \
+            --junitfile-testcase-classname=short \
+            -- -tags integration -count=1 -timeout 5m ./eas
+
+      # Surface integration-test analytics separately from unit so
+      # Codecov can track Z-Push-flakiness independently of pure-Go bugs.
+      - uses: codecov/test-results-action@v1
+        if: ${{ !cancelled() }}
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./junit-integration.xml
+          flags: integration
+          fail_ci_if_error: false
+
+      - name: container logs on failure
+        if: failure()
+        working-directory: testenv
+        run: docker compose logs
+
+      - name: tear down
+        if: always()
+        working-directory: testenv
+        run: docker compose down -v

@@ -1,0 +1,66 @@
+# Copyright (C) 2026 Henry Stern
+# SPDX-License-Identifier: MIT
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write   # needed to create the GitHub release
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0   # full history so release notes can diff against the previous tag
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          check-latest: true
+          cache: true
+
+      # Sanity gate: refuse to publish a release for a tag whose tree
+      # doesn't pass the same checks PRs do.
+      - name: lint
+        run: |
+          out=$(gofmt -l .); if [ -n "$out" ]; then echo "gofmt drift: $out"; exit 1; fi
+          go vet ./...
+          go build ./...
+
+      - name: test
+        run: go test -race -count=1 ./...
+
+      - name: create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Strip refs/tags/ → bare version (vX.Y.Z).
+          TAG="${GITHUB_REF#refs/tags/}"
+          # Mark anything with -alpha/-beta/-rc as a prerelease.
+          if echo "$TAG" | grep -qE '-(alpha|beta|rc)'; then
+            PRE=--prerelease
+          else
+            PRE=
+          fi
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes \
+            $PRE
+
+      # Warm up pkg.go.dev so the new tag is indexed promptly. Best-effort.
+      - name: refresh pkg.go.dev
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          curl -sf "https://proxy.golang.org/github.com/hstern/go-activesync/@v/$TAG.info" >/dev/null \
+            && echo "proxy.golang.org has $TAG" \
+            || echo "proxy.golang.org didn't see $TAG yet (it'll catch up)"

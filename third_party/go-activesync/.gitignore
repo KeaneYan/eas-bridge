@@ -1,0 +1,20 @@
+# Build / test artefacts
+*.test
+*.out
+coverage.html
+coverage.txt
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# Per-machine agent state (Claude Code permissions etc.)
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local Docker volumes (testenv leaves these behind on `make up`)
+testenv/.env

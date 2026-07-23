@@ -1,0 +1,37 @@
+// Copyright (C) 2026 Henry Stern
+// SPDX-License-Identifier: MIT
+
+// Provision handshake — two-phase policy negotiation per MS-ASPROV §3.1.5.1.
+// Render: dot -Tsvg provision.dot -o provision.svg
+digraph provision {
+    rankdir=TB;
+    bgcolor="white";
+    node [fontname="Helvetica", fontsize=11, shape=box, style="rounded,filled"];
+    edge [fontname="Helvetica", fontsize=10];
+
+    // Two swim lanes, kept aligned by invisible edges.
+    subgraph cluster_client {
+        label="Client (eas.Client)";
+        labeljust=l; fontname="Helvetica"; fontsize=12; color="#cccccc";
+        c0 [label="Provision()", fillcolor="#cfe2f3"];
+        c1 [label="persist TempPolicyKey\nvia StateStore", fillcolor="#cfe2f3"];
+        c2 [label="persist FinalPolicyKey;\nuse on every subsequent\nrequest as X-MS-PolicyKey", fillcolor="#cfe2f3"];
+    }
+
+    subgraph cluster_server {
+        label="EAS server";
+        labeljust=l; fontname="Helvetica"; fontsize=12; color="#cccccc";
+        s0 [label="evaluate request\n(empty PolicyKey)", fillcolor="#d9ead3"];
+        s1 [label="apply policy ack\n(client confirmed)", fillcolor="#d9ead3"];
+    }
+
+    // Sequence flow.
+    c0 -> s0 [label="POST Provision\n PolicyKey=\"0\"\n Policy{Type=MS-EAS-Provisioning-WBXML}"];
+    s0 -> c1 [label="200 OK\n TempPolicyKey + Policy doc"];
+    c1 -> s1 [label="POST Provision\n PolicyKey=Temp\n Status=1 (acknowledged)"];
+    s1 -> c2 [label="200 OK\n FinalPolicyKey"];
+
+    // Footnote.
+    note [shape=note, fillcolor="#fff2cc", label="On HTTP 449 (Retry With) from any later\ncommand, postRaw re-runs Provision and\nretries the original request once.\nMS-ASPROV §3.1.5.2."];
+    c2 -> note [style=dashed, arrowhead=none, color="#888888"];
+}

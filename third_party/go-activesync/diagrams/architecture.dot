@@ -1,0 +1,39 @@
+// Copyright (C) 2026 Henry Stern
+// SPDX-License-Identifier: MIT
+
+// go-activesync architecture: how a caller's command flows through the
+// library to an EAS server and back. Render: dot -Tsvg architecture.dot -o architecture.svg
+digraph architecture {
+    rankdir=LR;
+    bgcolor="white";
+    node [fontname="Helvetica", fontsize=11, shape=box, style="rounded,filled"];
+    edge [fontname="Helvetica", fontsize=10];
+
+    caller [label="Your application", fillcolor="#e7f3fe"];
+
+    subgraph cluster_lib {
+        label="github.com/hstern/go-activesync";
+        labeljust=l; fontname="Helvetica"; fontsize=11; color="#888888"; style=dashed;
+
+        eas     [label="eas.Client\n(interface)\n\nFolderSync, SyncEmail,\nSendMail, CreateEvent,\nResolveRecipients,\nProvision, Ping, …", fillcolor="#cfe2f3"];
+        wbxml   [label="wbxml\n\n25 EAS code pages\nMarshal / Unmarshal", fillcolor="#cfe2f3"];
+        state   [label="StateStore\n(interface)\n\nPolicyKey,\nper-folder SyncKey", fillcolor="#fff2cc"];
+        easmock [label="easmock\n\nhand-written\ntest doubles", fillcolor="#fce5cd", style="rounded,filled,dashed"];
+    }
+
+    transport [label="*http.Client\n+ optional auth wrap\n(NTLM / SPNEGO / mTLS)", fillcolor="#d9ead3"];
+    server    [label="EAS server\n\nZ-Push · SOGo ·\nExchange · Office 365", fillcolor="#d9ead3"];
+    store     [label="Your durable\nbackend\n(bbolt, SQLite, etc.)", fillcolor="#fff2cc", style="rounded,filled,dashed"];
+
+    caller -> eas [label="typed Go calls"];
+    eas -> wbxml [label="build WBXML body"];
+    wbxml -> eas [label="parse WBXML response", style=dashed];
+    eas -> transport [label="HTTP POST\nvnd.ms-sync.wbxml"];
+    transport -> server [label="HTTPS"];
+    server -> transport [label="200 OK + WBXML", style=dashed];
+
+    eas -> state [label="read/write keys", arrowhead=normal, dir=both];
+    state -> store [label="implementor's choice", style=dashed, arrowhead=none];
+
+    easmock -> eas [label="satisfies\nfor tests", style=dashed, arrowhead=onormal];
+}

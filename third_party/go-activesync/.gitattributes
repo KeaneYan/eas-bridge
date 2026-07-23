@@ -1,0 +1,17 @@
+# Copyright (C) 2026 Henry Stern
+# SPDX-License-Identifier: MIT
+
+# Normalize line endings across platforms.
+* text=auto eol=lf
+
+# SVG is XML — diff it as text so README diagram changes show up
+# in `git log -p` instead of being marked binary.
+*.svg text
+
+# .go and shell scripts are always LF.
+*.go    text eol=lf
+*.sh    text eol=lf
+
+# Lock files: tell git these are generated; they still merge but
+# pickup the right tooling hints in viewers.
+go.sum  -diff linguist-generated

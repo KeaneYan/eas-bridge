@@ -1,0 +1,34 @@
+// Copyright (C) 2026 Henry Stern
+// SPDX-License-Identifier: MIT
+
+// Anatomy of a WBXML tag byte. The 8 bits encode "has attributes",
+// "has content", and the 6-bit tag identity within the active code page.
+// Render: dot -Tsvg tag-byte.dot -o tag-byte.svg
+digraph tag_byte {
+    rankdir=TB;
+    bgcolor="white";
+    node [fontname="Helvetica", fontsize=10];
+    edge [fontname="Helvetica", fontsize=9];
+
+    // The bit table — eight cells, each labeled with bit number + role.
+    bits [shape=record, style=filled, fillcolor="#cfe2f3", fontsize=10,
+          label="{<b7> bit 7 \\n A flag | <b6> bit 6 \\n C flag | <b5> bit 5 | <b4> bit 4 | <b3> bit 3 | <b2> bit 2 | <b1> bit 1 | <b0> bit 0}"];
+
+    // What each region means, anchored under the bit cells.
+    aflag [shape=note, fillcolor="#fce5cd", fontsize=9,
+           label="A flag (0x80)\\nhas attributes\\n— EAS never sets this;\\ndecoder errors out"];
+    cflag [shape=note, fillcolor="#d9ead3", fontsize=9,
+           label="C flag (0x40)\\nhas content\\nbody followed by END (0x01)"];
+    ident [shape=note, fillcolor="#fff2cc", fontsize=9,
+           label="6-bit tag identity (0x05..0x3F)\\nlooked up against the active\\ncode page in the Registry"];
+
+    bits:b7 -> aflag [arrowhead=none];
+    bits:b6 -> cflag [arrowhead=none];
+    bits:b3 -> ident [arrowhead=none];
+
+    // Worked example.
+    eg [shape=record, style="filled,rounded", fillcolor="#e7f3fe", fontsize=10,
+        label="{Example: 0x56\\n= 0x40 \\| 0x16\\n= C-flag + identity 0x16|on page 7 (FolderHierarchy):\\n0x16 → \"FolderSync\"\\n→ <FolderSync> with content}"];
+
+    ident -> eg [style=dashed, arrowhead=none, color="#888888"];
+}
