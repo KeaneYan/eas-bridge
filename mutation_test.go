@@ -333,3 +333,69 @@ func TestCopyRejectsUnknownDest(t *testing.T) {
 		t.Fatal("expected error for unknown destination")
 	}
 }
+
+// TestStoreFlaggedLocalAndPush：STORE +FLAGS \Flagged 必须本地落 FlagStatus=2
+// 且上行 EmailChange.SetFlagStatus=2；去除星标对称。
+func TestStoreFlaggedLocalAndPush(t *testing.T) {
+	engine := newMutationTestEngine(t, &easmock.Client{})
+	sess := newMutationSession(engine)
+
+	readChanges, mutated, err := sess.applyFlagMutations(uidSetOf(1), &imap.StoreFlags{
+		Op:    imap.StoreFlagsAdd,
+		Flags: []imap.Flag{"\\Flagged"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(readChanges) != 1 || readChanges[0].SetFlagStatus == nil || *readChanges[0].SetFlagStatus != 2 {
+		t.Fatalf("SetFlagStatus 上行缺失: %+v", readChanges)
+	}
+	// 本地 state 已落
+	st := engine.st
+	st.mu.Lock()
+	got := st.Items["inbox"][0].FlagStatus
+	st.mu.Unlock()
+	if got != 2 {
+		t.Fatalf("本地 FlagStatus = %d, want 2", got)
+	}
+	// 响应 flags 含 \Flagged
+	found := false
+	for _, f := range mutated[0].flags {
+		if f == "\\Flagged" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("响应 flags 缺 \\Flagged: %+v", mutated[0].flags)
+	}
+
+	// 去星
+	readChanges, mutated, err = sess.applyFlagMutations(uidSetOf(1), &imap.StoreFlags{
+		Op:    imap.StoreFlagsDel,
+		Flags: []imap.Flag{"\\Flagged"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(readChanges) != 1 || *readChanges[0].SetFlagStatus != 0 {
+		t.Fatalf("去星上行缺失: %+v", readChanges)
+	}
+	st.mu.Lock()
+	got = st.Items["inbox"][0].FlagStatus
+	st.mu.Unlock()
+	if got != 0 {
+		t.Fatalf("去星后 FlagStatus = %d, want 0", got)
+	}
+	// itemFlags 反映星标
+	st.Items["inbox"][0] = eas.EmailItem{ServerID: "m1", FlagStatus: 2}
+	flags := itemFlags(st.Items["inbox"][0], false)
+	hasFlagged := false
+	for _, f := range flags {
+		if f == "\\Flagged" {
+			hasFlagged = true
+		}
+	}
+	if !hasFlagged {
+		t.Fatalf("itemFlags 缺 \\Flagged: %+v", flags)
+	}
+}

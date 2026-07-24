@@ -172,7 +172,7 @@ func (e *syncEngine) syncMailOnce(ctx context.Context, folderID string) error {
 		return syncErr
 	}
 	invalidated := make([]string, 0, len(added)+len(changed)+len(deleted))
-	err := e.st.mutate(func() {
+	err := e.st.mutateFolder(folderID, func() {
 		existing := map[string]eas.EmailItem{}
 		order := make([]string, 0, len(e.st.Items[folderID])+len(added))
 		for _, it := range e.st.Items[folderID] {
@@ -343,7 +343,7 @@ func (e *syncEngine) syncCalendarOnce(ctx context.Context) error {
 		shouldSave := (page+1)%10 == 0 || !res.MoreAvailable || page == 99
 		var saveErr error
 		if shouldSave {
-			saveErr = e.st.saveLocked()
+			saveErr = e.st.saveCalendarLocked()
 		}
 		e.st.mu.Unlock()
 		if saveErr != nil {

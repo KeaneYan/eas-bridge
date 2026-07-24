@@ -322,8 +322,8 @@ type flagMutation struct {
 	flags    []imap.Flag
 }
 
-// flagsFrom 按已读/删除标记构造 flags 列表。
-func flagsFrom(read, deleted bool) []imap.Flag {
+// flagsFrom 按已读/删除/星标构造 flags 列表。
+func flagsFrom(read, deleted, flagged bool) []imap.Flag {
 	var flags []imap.Flag
 	if read {
 		flags = append(flags, "\\Seen")
@@ -331,11 +331,14 @@ func flagsFrom(read, deleted bool) []imap.Flag {
 	if deleted {
 		flags = append(flags, "\\Deleted")
 	}
+	if flagged {
+		flags = append(flags, "\\Flagged")
+	}
 	return flags
 }
 
-// applyFlagMutations 应用 STORE 的 \Seen/\Deleted 变更到本地 state，
-// 返回需要回推服务器的已读变更与写回定位。失败即中止，已应用的不回滚。
+// applyFlagMutations 应用 STORE 的 \Seen/\Deleted/\Flagged 变更到本地 state，
+// 返回需要回推服务器的标志变更与写回定位。失败即中止，已应用的不回滚。
 // 结果 flags 在本函数内随变更一并算出，避免写回时二次加锁 O(n) 查找，
 // 也避免查找落空写出空 flags（ZCode HIGH-1）。
 func (sess *imapSession) applyFlagMutations(numSet imap.NumSet, storeFlags *imap.StoreFlags) ([]eas.EmailChange, []flagMutation, error) {
@@ -347,6 +350,7 @@ func (sess *imapSession) applyFlagMutations(numSet imap.NumSet, storeFlags *imap
 		serverID := item.ServerID
 		read := item.Read
 		deleted := snap.deleted[serverID]
+		flagged := item.FlagStatus == 2
 		for _, f := range storeFlags.Flags {
 			switch f {
 			case "\\Seen":
@@ -363,6 +367,21 @@ func (sess *imapSession) applyFlagMutations(numSet imap.NumSet, storeFlags *imap
 					}
 					read = false
 					readChanges = append(readChanges, eas.EmailChange{ServerID: serverID, Read: boolPtr(false)})
+				}
+			case "\\Flagged":
+				switch storeFlags.Op {
+				case imap.StoreFlagsSet, imap.StoreFlagsAdd:
+					if err := st.setFlagged(sess.selected, serverID, true); err != nil {
+						return err
+					}
+					flagged = true
+					readChanges = append(readChanges, eas.EmailChange{ServerID: serverID, SetFlagStatus: intPtr(2)})
+				case imap.StoreFlagsDel:
+					if err := st.setFlagged(sess.selected, serverID, false); err != nil {
+						return err
+					}
+					flagged = false
+					readChanges = append(readChanges, eas.EmailChange{ServerID: serverID, SetFlagStatus: intPtr(0)})
 				}
 			case "\\Deleted":
 				switch storeFlags.Op {
@@ -383,12 +402,14 @@ func (sess *imapSession) applyFlagMutations(numSet imap.NumSet, storeFlags *imap
 			seqNum:   seqNum,
 			uid:      snap.uidForSID[serverID],
 			serverID: serverID,
-			flags:    flagsFrom(read, deleted),
+			flags:    flagsFrom(read, deleted, flagged),
 		})
 		return nil
 	})
 	return readChanges, mutated, err
 }
+
+func intPtr(v int) *int { return &v }
 
 // pushReadChanges 批量回推已读状态到服务器。失败只记日志——本地状态已生效，
 // 若服务器随后以未读覆盖，下次增量同步会自然收敛。
@@ -785,7 +806,7 @@ func parseEASAddrs(raw string) []imap.Address {
 }
 
 func itemFlags(item eas.EmailItem, deleted bool) []imap.Flag {
-	return flagsFrom(item.Read, deleted)
+	return flagsFrom(item.Read, deleted, item.FlagStatus == 2)
 }
 
 func boolPtr(v bool) *bool { return &v }

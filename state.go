@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,25 +27,64 @@ type folderMeta struct {
 	UIDValidity uint32 `json:"uid_validity"`
 }
 
-// diskState 是进程内唯一的 EAS 同步状态 + IMAP UID 映射，JSON 持久化。
+// ---------- 持久化格式（分片） ----------
+//
+// 2026-07-25 重构：单文件 11.5MB 全量重写（每封已读/星标都 Marshal+fsync 整份）
+// → 按作用域分片：
+//   state.json          主文件：DeviceID/PolicyKey/SyncKeys/Folders/FolderMeta（小）
+//   folders/<fid>.json  每文件夹：Items/UIDs/Deleted（markRead 等单封操作只写此片）
+//   events.json         日历事件
+// 旧版单文件格式（含 items/uids/events/deleted 字段）首次加载时自动迁移。
+
+// stateMain 主文件结构。Legacy* 字段仅为读取旧格式存在，永不写回。
+type stateMain struct {
+	DeviceID     string                `json:"device_id"`
+	PolicyKeyVal string                `json:"policy_key"`
+	SyncKeys     map[string]string     `json:"sync_keys"`
+	Folders      []eas.Folder          `json:"folders"`
+	FolderMeta   map[string]folderMeta `json:"folder_meta"`
+
+	LegacyItems   map[string][]eas.EmailItem    `json:"items,omitempty"`
+	LegacyUIDs    map[string][]uidEntry         `json:"uids,omitempty"`
+	LegacyEvents  map[string]eas.EventItem      `json:"events,omitempty"`
+	LegacyDeleted map[string]map[string]bool    `json:"deleted,omitempty"`
+}
+
+// folderShard 单文件夹分片。FolderID 冗余存储便于加载时还原键。
+type folderShard struct {
+	FolderID string                 `json:"folder_id"`
+	Items    []eas.EmailItem        `json:"items"`
+	UIDs     []uidEntry             `json:"uids"`
+	Deleted  map[string]bool        `json:"deleted,omitempty"`
+}
+
+// eventsShard 日历事件分片。
+type eventsShard struct {
+	Events map[string]eas.EventItem `json:"events"`
+}
+
+// diskState 是进程内唯一的 EAS 同步状态 + IMAP UID 映射。
+// 内存结构与分片前一致；仅落盘粒度变化。
 type diskState struct {
-	path string
+	path string // 主文件 state.json
+	dir  string // state 目录（folders/ 与 events.json 所在）
 	mu   sync.Mutex
 
-	DeviceID     string                     `json:"device_id"`
-	PolicyKeyVal string                     `json:"policy_key"`
-	SyncKeys     map[string]string          `json:"sync_keys"`
-	Folders      []eas.Folder               `json:"folders"`
-	Items        map[string][]eas.EmailItem `json:"items"`       // folderID → 邮件缓存
-	UIDs         map[string][]uidEntry      `json:"uids"`        // folderID → UID 映射（按 UID 升序）
-	FolderMeta   map[string]folderMeta      `json:"folder_meta"` // folderID → UID 管理元数据
-	Events       map[string]eas.EventItem   `json:"events"`      // 日历事件缓存 serverID→event
-	Deleted      map[string]map[string]bool `json:"deleted,omitempty"` // folderID → serverID → 已标记 \Deleted
+	DeviceID     string
+	PolicyKeyVal string
+	SyncKeys     map[string]string
+	Folders      []eas.Folder
+	Items        map[string][]eas.EmailItem // folderID → 邮件缓存
+	UIDs         map[string][]uidEntry      // folderID → UID 映射（按 UID 升序）
+	FolderMeta   map[string]folderMeta      // folderID → UID 管理元数据
+	Events       map[string]eas.EventItem   // 日历事件缓存 serverID→event
+	Deleted      map[string]map[string]bool // folderID → serverID → 已标记 \Deleted
 }
 
 func loadState(path string) (*diskState, error) {
 	s := &diskState{
 		path:       path,
+		dir:        filepath.Dir(path),
 		SyncKeys:   map[string]string{},
 		Items:      map[string][]eas.EmailItem{},
 		UIDs:       map[string][]uidEntry{},
@@ -51,17 +92,95 @@ func loadState(path string) (*diskState, error) {
 		Events:     map[string]eas.EventItem{},
 		Deleted:    map[string]map[string]bool{},
 	}
-	b, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return s, nil
-	}
-	if err != nil {
+	if err := os.MkdirAll(filepath.Join(s.dir, "folders"), 0700); err != nil {
 		return nil, err
 	}
-	if err := json.Unmarshal(b, s); err != nil {
-		return nil, fmt.Errorf("state.json 损坏: %w", err)
+
+	// 1. 主文件
+	var legacy bool
+	b, err := os.ReadFile(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		// 全新启动
+	case err != nil:
+		return nil, err
+	default:
+		var m stateMain
+		if err := json.Unmarshal(b, &m); err != nil {
+			return nil, fmt.Errorf("state.json 损坏: %w", err)
+		}
+		s.DeviceID = m.DeviceID
+		s.PolicyKeyVal = m.PolicyKeyVal
+		s.SyncKeys = m.SyncKeys
+		s.Folders = m.Folders
+		s.FolderMeta = m.FolderMeta
+		// 旧格式迁移：主文件里还嵌着 items/uids/events/deleted
+		if len(m.LegacyItems) > 0 || len(m.LegacyUIDs) > 0 || len(m.LegacyEvents) > 0 || len(m.LegacyDeleted) > 0 {
+			legacy = true
+			for fid, items := range m.LegacyItems {
+				s.Items[fid] = items
+			}
+			for fid, uids := range m.LegacyUIDs {
+				s.UIDs[fid] = uids
+			}
+			for sid, ev := range m.LegacyEvents {
+				s.Events[sid] = ev
+			}
+			for fid, del := range m.LegacyDeleted {
+				s.Deleted[fid] = del
+			}
+		}
 	}
-	s.path = path
+
+	// 2. 文件夹分片（分片数据优先于 legacy——同名 folder 已被分片覆盖的不回退）
+	shardDir := filepath.Join(s.dir, "folders")
+	entries, err := os.ReadDir(shardDir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	for _, ent := range entries {
+		if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(shardDir, ent.Name()))
+		if err != nil {
+			continue // 坏片跳过，全量同步会重建
+		}
+		var sh folderShard
+		if json.Unmarshal(data, &sh) != nil || sh.FolderID == "" {
+			continue
+		}
+		s.Items[sh.FolderID] = sh.Items
+		s.UIDs[sh.FolderID] = sh.UIDs
+		if sh.Deleted != nil {
+			s.Deleted[sh.FolderID] = sh.Deleted
+		}
+	}
+
+	// 3. 日历分片
+	if data, err := os.ReadFile(filepath.Join(s.dir, "events.json")); err == nil {
+		var es eventsShard
+		if json.Unmarshal(data, &es) == nil && es.Events != nil {
+			s.Events = es.Events
+		}
+	}
+
+	s.normalize()
+
+	// 4. 迁移落地：把旧格式内容写入分片，主文件重写为无 legacy 的小文件
+	if legacy {
+		for fid := range s.Items {
+			_ = s.saveFolderLocked(fid)
+		}
+		_ = s.saveEventsLocked()
+		if err := s.saveMainLocked(); err != nil {
+			return nil, fmt.Errorf("迁移 state.json 分片失败: %w", err)
+		}
+	}
+	return s, nil
+}
+
+func (s *diskState) normalize() {
 	if s.SyncKeys == nil {
 		s.SyncKeys = map[string]string{}
 	}
@@ -80,30 +199,105 @@ func loadState(path string) (*diskState, error) {
 	if s.Deleted == nil {
 		s.Deleted = map[string]map[string]bool{}
 	}
-	return s, nil
 }
 
-// save 原子写（tmp+rename），持锁状态全量快照。
-func (s *diskState) save() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.saveLocked()
+// shardFileName 把 folderID 转为安全的文件名（EAS folderID 形如
+// "1"/"9722593"/"Event:DEFAULT"，非安全字符替换为 '_'）。
+func shardFileName(folderID string) string {
+	var b strings.Builder
+	for _, r := range folderID {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	return b.String() + ".json"
 }
 
-func (s *diskState) saveLocked() error {
-	b, err := json.Marshal(s)
+// ---------- 落盘（调用方须已持 s.mu） ----------
+
+// saveMainLocked 写主文件（DeviceID/PolicyKey/SyncKeys/Folders/FolderMeta）。
+func (s *diskState) saveMainLocked() error {
+	m := stateMain{
+		DeviceID:     s.DeviceID,
+		PolicyKeyVal: s.PolicyKeyVal,
+		SyncKeys:     s.SyncKeys,
+		Folders:      s.Folders,
+		FolderMeta:   s.FolderMeta,
+	}
+	b, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
 	return atomicWriteFile(s.path, b, 0600)
 }
 
-// mutate 持锁执行 fn 并原子落盘。
+// saveFolderLocked 写单文件夹分片（Items/UIDs/Deleted）。
+func (s *diskState) saveFolderLocked(folderID string) error {
+	sh := folderShard{
+		FolderID: folderID,
+		Items:    s.Items[folderID],
+		UIDs:     s.UIDs[folderID],
+		Deleted:  s.Deleted[folderID],
+	}
+	b, err := json.Marshal(sh)
+	if err != nil {
+		return err
+	}
+	return atomicWriteFile(filepath.Join(s.dir, "folders", shardFileName(folderID)), b, 0600)
+}
+
+// saveEventsLocked 写日历事件分片。
+func (s *diskState) saveEventsLocked() error {
+	b, err := json.Marshal(eventsShard{Events: s.Events})
+	if err != nil {
+		return err
+	}
+	return atomicWriteFile(filepath.Join(s.dir, "events.json"), b, 0600)
+}
+
+// saveLocked 全量落盘（主+全部分片+事件）。仅用于启动迁移等批量场景；
+// 常规路径用定向落盘（saveMainLocked/saveFolderLocked/saveEventsLocked）。
+func (s *diskState) saveLocked() error {
+	for fid := range s.Items {
+		if err := s.saveFolderLocked(fid); err != nil {
+			return err
+		}
+	}
+	if err := s.saveEventsLocked(); err != nil {
+		return err
+	}
+	return s.saveMainLocked()
+}
+
+// save 原子写（tmp+rename），持锁全量快照。
+func (s *diskState) save() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saveLocked()
+}
+
+// mutate 持锁执行 fn 并落盘主文件（Folders/PolicyKey 等主文件作用域的变更）。
 func (s *diskState) mutate(fn func()) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	fn()
-	return s.saveLocked()
+	return s.saveMainLocked()
+}
+
+// mutateFolder 持锁执行 fn 并落盘该文件夹分片 + 主文件
+// （syncMailOnce 同时推进 Items/UIDs（分片）与 FolderMeta/SyncKeys（主文件））。
+func (s *diskState) mutateFolder(folderID string, fn func()) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fn()
+	if err := s.saveFolderLocked(folderID); err != nil {
+		return err
+	}
+	return s.saveMainLocked()
 }
 
 // ---------- EAS StateStore 接口实现 ----------
@@ -238,7 +432,7 @@ func (s *diskState) serverIDForUID(folderID string, uid uint32) string {
 	return ""
 }
 
-// markRead 标记某封邮件为已读（内存 + 磁盘），并返回需要推 EAS 的 serverID。
+// markRead 标记某封邮件为已读（内存 + 该文件夹分片），并返回需要推 EAS 的 serverID。
 func (s *diskState) markRead(folderID, serverID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -250,7 +444,7 @@ func (s *diskState) markRead(folderID, serverID string) error {
 			break
 		}
 	}
-	return s.saveLocked()
+	return s.saveFolderLocked(folderID)
 }
 
 // markUnread 标记某封邮件为未读。
@@ -265,7 +459,26 @@ func (s *diskState) markUnread(folderID, serverID string) error {
 			break
 		}
 	}
-	return s.saveLocked()
+	return s.saveFolderLocked(folderID)
+}
+
+// setFlagged 标记/清除某封邮件的星标（\Flagged，EAS FlagStatus 2/0）。
+func (s *diskState) setFlagged(folderID, serverID string, flagged bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items := s.Items[folderID]
+	for i := range items {
+		if items[i].ServerID == serverID {
+			if flagged {
+				items[i].FlagStatus = 2
+			} else {
+				items[i].FlagStatus = 0
+			}
+			s.Items[folderID] = items
+			break
+		}
+	}
+	return s.saveFolderLocked(folderID)
 }
 
 // setDeleted 标记/清除某封邮件的 \Deleted 旗标（本地标记，EXPUNGE 时才真正删除）。
@@ -282,7 +495,7 @@ func (s *diskState) setDeleted(folderID, serverID string, deleted bool) error {
 	} else {
 		delete(m, serverID)
 	}
-	return s.saveLocked()
+	return s.saveFolderLocked(folderID)
 }
 
 // isDeleted 查询邮件是否被标记 \Deleted。调用方需已持有锁或使用本方法的锁。
@@ -312,7 +525,7 @@ func (s *diskState) removeItems(folderID string, serverIDs ...string) error {
 			delete(m, id)
 		}
 	}
-	return s.saveLocked()
+	return s.saveFolderLocked(folderID)
 }
 
 // addMovedItems 把 MoveItems 移入的邮件追加到目标文件夹并分配 UID。
@@ -325,7 +538,11 @@ func (s *diskState) addMovedItems(dstFolder string, items []eas.EmailItem) error
 	defer s.mu.Unlock()
 	s.Items[dstFolder] = append(s.Items[dstFolder], items...)
 	s.Items[dstFolder] = s.assignUIDs(dstFolder, s.Items[dstFolder])
-	return s.saveLocked()
+	// assignUIDs 推进了 FolderMeta（主文件），两处都要落
+	if err := s.saveFolderLocked(dstFolder); err != nil {
+		return err
+	}
+	return s.saveMainLocked()
 }
 
 // resetSyncKey 清除文件夹的 synckey 并立即落盘（下次同步从头引导）。
@@ -334,15 +551,24 @@ func (s *diskState) resetSyncKey(folderID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.SyncKeys, folderID)
-	return s.saveLocked()
+	return s.saveMainLocked()
 }
 
-// saveNow 立即落盘（synckey 前进但邮件无变更时调用——key 不落盘的话，
+// saveNow 立即落盘主文件（synckey 前进但邮件无变更时调用——key 不落盘的话，
 // 重启后从旧 key 恢复会被 Coremail 判失效返回 Status 5）。
 func (s *diskState) saveNow() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.saveLocked()
+	return s.saveMainLocked()
+}
+
+// saveCalendarLocked 日历同步后落盘：事件分片 + 主文件（synckey）。
+// 调用方须已持 s.mu（供 syncCalendarOnce 在锁内调用）。
+func (s *diskState) saveCalendarLocked() error {
+	if err := s.saveEventsLocked(); err != nil {
+		return err
+	}
+	return s.saveMainLocked()
 }
 
 // upsertEvent 写入/更新日历事件（CalDAV 写操作后本地落库）。
@@ -351,7 +577,7 @@ func (s *diskState) upsertEvent(ev eas.EventItem) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Events[ev.ServerID] = ev
-	return s.saveLocked()
+	return s.saveEventsLocked()
 }
 
 // deleteEvent 删除日历事件（CalDAV DELETE 后本地落库）。
@@ -359,5 +585,5 @@ func (s *diskState) deleteEvent(serverID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.Events, serverID)
-	return s.saveLocked()
+	return s.saveEventsLocked()
 }
