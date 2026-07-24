@@ -98,6 +98,10 @@ tail -f ~/Library/Logs/eas-bridge.log      # 看日志
 
 姊妹项目 [eas-mail-macos](https://github.com/KeaneYan/eas-mail-macos)（原生 SwiftUI 客户端）共用 `third_party/go-activesync` fork。本项目独立 DeviceID + 独立 state 目录（`~/.config/eas-bridge/`），两者可同时对同一账号同步互不干扰。
 
+## 开发
+
+**[docs/DEV-NOTES.md](docs/DEV-NOTES.md)**：开发者避坑指南——Coremail 服务器怪癖（全部实测背书）、EAS 协议实战、架构不变量、测试纪律。**改代码前必读**，都是真实事故换来的。
+
 ## 当前限制（v1）
 
 - 删除邮件 = 移到服务器"已删除"文件夹（可恢复）；无永久删除
