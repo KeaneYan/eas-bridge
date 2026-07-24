@@ -121,9 +121,11 @@ func (e *syncEngine) syncMailOnce(ctx context.Context, folderID string) error {
 	// EAS Sync 按 WindowSize 分页，单页最多 200 封；MoreAvailable 时必须翻页拉完，
 	// 否则超过 200 封的文件夹只能看到最新的一页（老邮件不可见）。
 	// 中途出错时先落盘已拉到的页（synckey 按页持久化，下次从断点续拉），再返回错误。
+	keyBefore, _ := e.st.SyncKey(ctx, folderID)
 	var added, changed []eas.EmailItem
 	var deleted []string
 	var syncErr error
+	retried := false
 	for page := 0; ; page++ {
 		if page >= 500 {
 			syncErr = fmt.Errorf("邮件同步超过 500 页仍未完成")
@@ -137,6 +139,18 @@ func (e *syncEngine) syncMailOnce(ctx context.Context, folderID string) error {
 			DateFilter: eas.FilterSixMonth,
 		})
 		if err != nil {
+			// Coremail 对失效 synckey 回 Status 5 而非规范的 3（fork 不会自动重置）。
+			// 自愈：清 key 全量重拉一次；再失败才视为真实故障。
+			if eas.IsStatusCode(err, 5) && !retried {
+				log.Printf("[sync] %s Status 5，按失效 synckey 处理：重置并全量重拉", folderID)
+				if rerr := e.st.resetSyncKey(folderID); rerr != nil {
+					log.Printf("[sync] 重置 synckey 失败: %v", rerr)
+				}
+				retried = true
+				added, changed, deleted = nil, nil, nil
+				page = -1
+				continue
+			}
 			syncErr = err
 			break
 		}
@@ -147,9 +161,14 @@ func (e *syncEngine) syncMailOnce(ctx context.Context, folderID string) error {
 			break
 		}
 	}
-	// 无变更：不落盘、不失效缓存。内存中的新 synckey 暂不持久化——
-	// 崩溃后从上次落盘的 key 重拉，merge 按 serverID 幂等，无丢失风险。
+	// 无变更：不失效缓存。但 synckey 前进必须落盘——Coremail 对旧 key 判失效
+	// 回 Status 5（2026-07-24 实测：重启从两天前的落盘 key 恢复，全文件夹被拒）。
 	if len(added) == 0 && len(changed) == 0 && len(deleted) == 0 {
+		if keyAfter, _ := e.st.SyncKey(ctx, folderID); keyAfter != keyBefore {
+			if err := e.st.saveNow(); err != nil {
+				log.Printf("[sync] %s synckey 落盘失败: %v", folderID, err)
+			}
+		}
 		return syncErr
 	}
 	invalidated := make([]string, 0, len(added)+len(changed)+len(deleted))
@@ -295,9 +314,20 @@ func (e *syncEngine) syncCalendarOnce(ctx context.Context) error {
 	if calFolderID == "" {
 		return fmt.Errorf("服务器没有日历文件夹")
 	}
+	retried := false
 	for page := 0; page < 100; page++ {
 		res, err := e.c.SyncCalendar(ctx, calFolderID, eas.CalendarSyncOptions{WindowSize: 100})
 		if err != nil {
+			// 与 syncMailOnce 同理：Coremail 对失效 synckey 回 Status 5，清 key 重拉一次
+			if eas.IsStatusCode(err, 5) && !retried {
+				log.Printf("[sync] 日历 Status 5，按失效 synckey 处理：重置并全量重拉")
+				if rerr := e.st.resetSyncKey(calFolderID); rerr != nil {
+					log.Printf("[sync] 重置日历 synckey 失败: %v", rerr)
+				}
+				retried = true
+				page = -1
+				continue
+			}
 			return fmt.Errorf("SyncCalendar: %w", err)
 		}
 		e.st.mu.Lock()

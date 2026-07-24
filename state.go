@@ -328,6 +328,23 @@ func (s *diskState) addMovedItems(dstFolder string, items []eas.EmailItem) error
 	return s.saveLocked()
 }
 
+// resetSyncKey 清除文件夹的 synckey 并立即落盘（下次同步从头引导）。
+// 用于 Coremail 对失效 synckey 回 Status 5 的自愈路径。
+func (s *diskState) resetSyncKey(folderID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.SyncKeys, folderID)
+	return s.saveLocked()
+}
+
+// saveNow 立即落盘（synckey 前进但邮件无变更时调用——key 不落盘的话，
+// 重启后从旧 key 恢复会被 Coremail 判失效返回 Status 5）。
+func (s *diskState) saveNow() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saveLocked()
+}
+
 // upsertEvent 写入/更新日历事件（CalDAV 写操作后本地落库）。
 // EAS 不回显本设备变更，与 addMovedItems 同理必须自行落库。
 func (s *diskState) upsertEvent(ev eas.EventItem) error {

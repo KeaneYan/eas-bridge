@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -429,36 +430,51 @@ func (sess *imapSession) Search(numKind imapserver.NumKind, criteria *imap.Searc
 		return nil, fmt.Errorf("未选中文件夹")
 	}
 	snap := sess.snap
-	// 检查是否有 "NOT \Seen" 条件（未读过滤）
-	unseenOnly := false
-	for _, f := range criteria.NotFlag {
-		if f == "\\Seen" {
-			unseenOnly = true
-			break
-		}
+	folderID := sess.selected
+	sc := &searchContext{
+		snap: snap,
+		bodyText: func(serverID string) (string, bool) {
+			return peekCachedBodyText(folderID, serverID)
+		},
 	}
+	matches := filterSearch(sc, criteria)
 	data := &imap.SearchData{}
 	switch numKind {
 	case imapserver.NumKindSeq:
 		var seqSet imap.SeqSet
-		for i, it := range snap.items {
-			if unseenOnly && it.Read {
-				continue
-			}
+		for _, i := range matches {
 			seqSet.AddNum(uint32(i + 1))
 		}
 		data.All = seqSet
 	case imapserver.NumKindUID:
 		var uidSet imap.UIDSet
-		for _, it := range snap.items {
-			if unseenOnly && it.Read {
-				continue
-			}
-			uidSet.AddNum(imap.UID(snap.uidForSID[it.ServerID]))
+		for _, i := range matches {
+			uidSet.AddNum(imap.UID(snap.uidForSID[snap.items[i].ServerID]))
 		}
 		data.All = uidSet
 	}
 	return data, nil
+}
+
+// peekCachedBodyText 只读缓存获取邮件正文文本（无缓存返回 ok=false）。
+// SEARCH 没有 ctx 可用，正文搜索不触发网络拉取（否则一次正文搜索可能
+// 引发数百封逐个拉取）。Apple Mail 的全文搜索走本地索引，不受此限。
+func peekCachedBodyText(folderID, serverID string) (string, bool) {
+	for _, path := range []string{
+		messageFullMIMEPath(folderID, serverID),
+		messageRawMIMEPath(folderID, serverID),
+	} {
+		if data, err := readCacheFile(path); err == nil && validRFC822(data) {
+			return extractSearchableText(data), true
+		}
+	}
+	if data, err := readCacheFile(messageMetadataPath(folderID, serverID)); err == nil {
+		var cached cachedMessageMetadata
+		if json.Unmarshal(data, &cached) == nil && cached.PlainBody != "" {
+			return cached.PlainBody, true
+		}
+	}
+	return "", false
 }
 
 // moveItemsStatusOK 是 MS-ASCMD MoveItems 的成功状态码（注意：不是 eas.StatusOK=1）。
