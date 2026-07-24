@@ -60,6 +60,11 @@ IMAP COPY 用 MoveItems 实现（移动语义，与 DavMail 一致）；APPEND �
 ### 上行 Sync 请求建议带 GetChanges=0 + DeletesAsMoves=1
 只上传变更时，避免服务器同帧下发变更。
 
+### FetchAttachment 的 Data 是未解码 base64 原文，调用方必须解码（2026-07-25 图片全挂事故）
+fork 保持上游语义不解码（FORK-NOTES）。eas-bridge 曾直接用 `got.Data` 构建 MIME → `writeBase64` 二次编码 → 双层 base64，Apple Mail 解一层后拿到 `iVBORw0K...` 文本，**所有图片/附件全坏**。修复：解码收拢进 `downloadAttachment`（尺寸引导 `decodeAttachmentData`，与 webank-mail 逐字节一致）。
+**分块路径两个叠加坑**（ZCode B-1/H-1）：① 每块的 Data 是**独立** base64 编码各自带 padding（4MB 不被 3 整除，中间块必有 `==`），拼接后整体解码必然在中间 padding 处失败；② Range 作用于**原始字节**（MS-ASCMD：附件 range applies to the file content），偏移必须按**解码后**长度推进，按 base64 文本长度推进会跳 ~1/3 内容。正确姿势：逐块 `decodeBase64Chunk` → 拼接原始字节。
+**改 MIME 构建后必须 bump `mimeCacheVersion`**——已污染的 .eml/.bin 缓存不会自愈。
+
 ## 三、架构不变量
 
 1. **IMAP UID 1-based 单调递增、持久化**（serverID↔UID 双向映射 + folderMeta.NextUID/UIDValidity）；UIDVALIDITY 恒定，state 重置才 bump（客户端会全量重下）。
