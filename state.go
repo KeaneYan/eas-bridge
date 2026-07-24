@@ -30,13 +30,14 @@ type diskState struct {
 	path string
 	mu   sync.Mutex
 
-	DeviceID     string                    `json:"device_id"`
-	PolicyKeyVal string                    `json:"policy_key"`
-	SyncKeys     map[string]string         `json:"sync_keys"`
-	Folders      []eas.Folder              `json:"folders"`
-	Items        map[string][]eas.EmailItem `json:"items"`   // folderID → 邮件缓存
-	UIDs         map[string][]uidEntry     `json:"uids"`    // folderID → UID 映射（按 UID 升序）
-	FolderMeta   map[string]folderMeta     `json:"folder_meta"` // folderID → UID 管理元数据
+	DeviceID     string                     `json:"device_id"`
+	PolicyKeyVal string                     `json:"policy_key"`
+	SyncKeys     map[string]string          `json:"sync_keys"`
+	Folders      []eas.Folder               `json:"folders"`
+	Items        map[string][]eas.EmailItem `json:"items"`       // folderID → 邮件缓存
+	UIDs         map[string][]uidEntry      `json:"uids"`        // folderID → UID 映射（按 UID 升序）
+	FolderMeta   map[string]folderMeta      `json:"folder_meta"` // folderID → UID 管理元数据
+	Events       map[string]eas.EventItem   `json:"events"`      // 日历事件缓存 serverID→event
 }
 
 func loadState(path string) (*diskState, error) {
@@ -46,6 +47,7 @@ func loadState(path string) (*diskState, error) {
 		Items:      map[string][]eas.EmailItem{},
 		UIDs:       map[string][]uidEntry{},
 		FolderMeta: map[string]folderMeta{},
+		Events:     map[string]eas.EventItem{},
 	}
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -69,6 +71,9 @@ func loadState(path string) (*diskState, error) {
 	}
 	if s.FolderMeta == nil {
 		s.FolderMeta = map[string]folderMeta{}
+	}
+	if s.Events == nil {
+		s.Events = map[string]eas.EventItem{}
 	}
 	return s, nil
 }

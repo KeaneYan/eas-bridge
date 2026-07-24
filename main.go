@@ -73,12 +73,28 @@ func main() {
 		}
 	}()
 
+	// 初始日历同步（失败不致命，CalDAV 查询时会重试）
+	if err := engine.syncCalendar(ctx); err != nil {
+		log.Printf("[sync] 日历初始同步失败（查询时会重试）: %v", err)
+	} else {
+		engine.st.mu.Lock()
+		log.Printf("[sync] 日历同步完成，%d 个事件", len(engine.st.Events))
+		engine.st.mu.Unlock()
+	}
+
+	// 启动 CalDAV 服务
+	go func() {
+		if err := serveCalDAV(engine, cfg.CalDAVAddr); err != nil {
+			log.Fatal("[caldav] ", err)
+		}
+	}()
+
 	// 启动轮询（变更时 fan-out 广播给所有 IDLE 会话）
 	go engine.poller(ctx, time.Duration(cfg.PollSecs)*time.Second, func(folderID string) {
 		imapd.broadcast(folderID)
 	})
 
-	log.Printf("[imeg-eas] 就绪。IMAP %s  SMTP %s（Ctrl+C 退出）", cfg.IMAPAddr, cfg.SMTPAddr)
+	log.Printf("[imeg-eas] 就绪。IMAP %s  SMTP %s  CalDAV %s（Ctrl+C 退出）", cfg.IMAPAddr, cfg.SMTPAddr, cfg.CalDAVAddr)
 
 	// 等待退出信号
 	sig := make(chan os.Signal, 1)

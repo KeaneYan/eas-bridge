@@ -12,9 +12,10 @@ type config struct {
 	Server   string `json:"server"`
 	User     string `json:"user"`
 	Password string `json:"password"`
-	IMAPAddr string `json:"imap_addr"`  // 监听地址，默认 "127.0.0.1:1143"
-	SMTPAddr string `json:"smtp_addr"`  // 监听地址，默认 "127.0.0.1:1025"
-	PollSecs int    `json:"poll_seconds"` // 邮件同步间隔，默认 60
+	IMAPAddr  string `json:"imap_addr"`   // 监听地址，默认 "127.0.0.1:1143"
+	SMTPAddr  string `json:"smtp_addr"`   // 监听地址，默认 "127.0.0.1:1025"
+	CalDAVAddr string `json:"caldav_addr"` // 监听地址，默认 "127.0.0.1:8008"
+	PollSecs  int    `json:"poll_seconds"` // 邮件同步间隔，默认 60
 }
 
 func configDir() string {
@@ -44,8 +45,11 @@ func loadConfig() (*config, error) {
 	if cfg.SMTPAddr == "" {
 		cfg.SMTPAddr = "127.0.0.1:1025"
 	}
+	if cfg.CalDAVAddr == "" {
+		cfg.CalDAVAddr = "127.0.0.1:8008"
+	}
 	// H4 防护：明文认证服务只应绑回环——非回环地址拒绝启动
-	for _, a := range []string{cfg.IMAPAddr, cfg.SMTPAddr} {
+	for _, a := range []string{cfg.IMAPAddr, cfg.SMTPAddr, cfg.CalDAVAddr} {
 		if !isLoopbackAddr(a) {
 			return nil, fmt.Errorf("监听地址 %s 非回环：imeg-eas 使用明文认证，只允许 127.0.0.1/localhost（确需对外请自行加 TLS 后再改）", a)
 		}

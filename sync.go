@@ -243,6 +243,46 @@ func constructRFC822(item eas.EmailItem) []byte {
 	return buf.Bytes()
 }
 
+// syncCalendar 增量同步日历事件到 st.Events（synckey 由库自动持久化）。
+// Coremail 忽略 FilterType，首次全量拉取后靠 synckey 增量。
+func (e *syncEngine) syncCalendar(ctx context.Context) error {
+	e.st.mu.Lock()
+	var calFolderID string
+	for _, f := range e.st.Folders {
+		if f.Type == eas.FolderTypeCalendar {
+			calFolderID = f.ServerID
+			break
+		}
+	}
+	e.st.mu.Unlock()
+	if calFolderID == "" {
+		return fmt.Errorf("服务器没有日历文件夹")
+	}
+	for page := 0; page < 100; page++ {
+		res, err := e.c.SyncCalendar(ctx, calFolderID, eas.CalendarSyncOptions{WindowSize: 100})
+		if err != nil {
+			return fmt.Errorf("SyncCalendar: %w", err)
+		}
+		if err := e.st.mutate(func() {
+			for _, ev := range res.Added {
+				e.st.Events[ev.ServerID] = ev
+			}
+			for _, ev := range res.Changed {
+				e.st.Events[ev.ServerID] = ev
+			}
+			for _, id := range res.Deleted {
+				delete(e.st.Events, id)
+			}
+		}); err != nil {
+			return err
+		}
+		if !res.MoreAvailable {
+			return nil
+		}
+	}
+	return fmt.Errorf("日历同步超过 100 页仍未完成")
+}
+
 func (e *syncEngine) poller(ctx context.Context, interval time.Duration, onChange func(folderID string)) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
