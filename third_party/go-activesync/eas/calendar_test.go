@@ -1033,3 +1033,44 @@ func TestFormatEASTime(t *testing.T) {
 		t.Errorf("got %q want %q", got, want)
 	}
 }
+
+// TestBuildEventApp_wireOrder 锁定 ApplicationData 子元素的 WBXML 线序为
+// Z-Push SyncAppointment 的实战顺序（对真实 Exchange 久经验证）。
+// 元素名集合按出现顺序断言，防止回归成无序输出。
+func TestBuildEventApp_wireOrder(t *testing.T) {
+	start := time.Date(2026, 5, 12, 14, 0, 0, 0, time.UTC)
+	app := buildEventApp(EventDraft{
+		Subject:   "Order",
+		Location:  "L",
+		StartTime: start,
+		EndTime:   start.Add(time.Hour),
+		Body:      "b",
+		Reminder:  10,
+		Attendees: []EventAttendee{{Email: "a@x"}},
+		Recurrence: &Recurrence{
+			Type: RecurrenceDaily, Interval: 1,
+		},
+		Exceptions:  []Exception{{ExceptionStartTime: start, Deleted: true}},
+		TimeZoneRaw: "raw",
+		UID:         "uid-1",
+	})
+	var got []string
+	for _, c := range app.Children {
+		if el, ok := c.(*wbxml.Element); ok {
+			got = append(got, el.Name)
+		}
+	}
+	want := []string{
+		"TimeZone", "DTStamp", "StartTime", "Subject", "UID",
+		"Location", "EndTime", "Recurrence", "Sensitivity", "BusyStatus",
+		"Reminder", "Attendees", "Body", "Exceptions",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("child count = %d (%v), want %d (%v)", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("order[%d] = %s, want %s; full = %v", i, got[i], want[i], got)
+		}
+	}
+}

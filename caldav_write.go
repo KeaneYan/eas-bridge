@@ -37,6 +37,17 @@ func (b *caldavBackend) PutCalendarObject(ctx context.Context, path string, cale
 	b.engine.st.mu.Lock()
 	existing, isUpdate := b.engine.st.Events[serverID]
 	b.engine.st.mu.Unlock()
+	if !isUpdate {
+		// 客户端显式声明"仅当不存在才写入"（If-None-Match: *）→ 明确是创建。
+		// 否则 path 形如服务器分配的 ID（Coremail sid 含冒号，如 Event:DEFAULT:1）
+		// 但本地没有——多半是 state 缺失/事件在同步窗口外，此时当创建会在服务器
+		// 产生重复事件（ZCode B1）。拒绝并要求客户端刷新。
+		clientAssertsCreate := opts != nil && opts.IfNoneMatch.IsSet()
+		if !clientAssertsCreate && strings.Contains(serverID, ":") {
+			return nil, webdavErr(http.StatusPreconditionFailed,
+				"事件不在本地缓存，为避免服务器产生重复事件已拒绝写入；请刷新日历后重试")
+		}
+	}
 
 	draft, uid, err := icalEventToDraft(ev, isUpdate)
 	if err != nil {
@@ -195,16 +206,19 @@ func icalEventToDraft(e *ical.Event, isUpdate bool) (eas.EventDraft, string, err
 		}
 	}
 	// EXDATE → 删除型例外（修改型例外 v1 忽略，与读路径一致）
+	// 单个 EXDATE 属性可携带逗号分隔的多值（RFC 5545 §3.8.5.1）。
 	exdates := e.Props[ical.PropExceptionDates]
 	for i := range exdates {
-		t, _, err := parseICalDateTime(&exdates[i])
-		if err != nil {
-			continue
+		for _, v := range strings.Split(exdates[i].Value, ",") {
+			t, _, err := parseICalDateTimeValue(strings.TrimSpace(v), exdates[i].Params.Get("TZID"))
+			if err != nil {
+				continue
+			}
+			d.Exceptions = append(d.Exceptions, eas.Exception{
+				ExceptionStartTime: t,
+				Deleted:            true,
+			})
 		}
-		d.Exceptions = append(d.Exceptions, eas.Exception{
-			ExceptionStartTime: t,
-			Deleted:            true,
-		})
 	}
 	if d.Subject == "" {
 		return d, uid, fmt.Errorf("事件缺少标题（SUMMARY）")
@@ -218,19 +232,30 @@ func parseICalDateTime(p *ical.Prop) (time.Time, bool, error) {
 	if p == nil {
 		return time.Time{}, false, fmt.Errorf("属性缺失")
 	}
-	v := strings.TrimSpace(p.Value)
+	return parseICalDateTimeValue(strings.TrimSpace(p.Value), p.Params.Get("TZID"))
+}
+
+// parseICalDateTimeValue 解析时间值。TZID 参数优先（Apple 日历几乎总带
+// TZID=Asia/Shanghai）；无时区后缀且无 TZID 的浮点时间按进程本地时区解释。
+func parseICalDateTimeValue(v, tzid string) (time.Time, bool, error) {
 	// VALUE=DATE：YYYYMMDD
 	if len(v) == 8 && !strings.ContainsAny(v, "T") {
 		t, err := time.ParseInLocation("20060102", v, time.UTC)
 		return t, true, err
 	}
-	// DATE-TIME：带 Z 为 UTC，否则按浮点时间用本地时区解释
+	// DATE-TIME：带 Z 为 UTC
 	layout := "20060102T150405"
 	if strings.HasSuffix(v, "Z") {
 		t, err := time.Parse(layout+"Z", v)
 		return t.UTC(), false, err
 	}
-	t, err := time.ParseInLocation(layout, v, time.Local)
+	loc := time.Local
+	if tzid != "" {
+		if l, err := time.LoadLocation(tzid); err == nil {
+			loc = l
+		}
+	}
+	t, err := time.ParseInLocation(layout, v, loc)
 	return t.UTC(), false, err
 }
 

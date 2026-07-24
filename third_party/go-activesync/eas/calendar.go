@@ -452,10 +452,12 @@ func (c *httpClient) sendSyncCommands(ctx context.Context, folderID string, cmds
 
 func buildEventApp(draft EventDraft) *wbxml.Element {
 	app := wbxml.E(wbxml.PageAirSync, "ApplicationData")
-	// Coremail 严格校验 ApplicationData 子元素的 schema 顺序（Z-Push 容忍乱序），
-	// 必须按 MS-ASCAL 序列输出：TimeZone→AllDayEvent→Attendees→Body→BusyStatus→
-	// Sensitivity→DtStamp→EndTime→Location→Recurrence→Exceptions→Reminder→
-	// StartTime→Subject→UID。乱序会导致 Sync Add 返回 Status 5 (ServerError)。
+	// 子元素按 Z-Push SyncAppointment 的 WBXML 线序输出（TimeZone→DTStamp→
+	// StartTime→Subject→UID→Location→EndTime→Recurrence→Sensitivity→BusyStatus→
+	// AllDayEvent→Reminder→Attendees→Body→Exceptions）——该实现对真实 Exchange
+	// 久经验证，是拿不到 MS-ASCAL 原始 XSD 时最可靠的事实标准。
+	// 注意：此前"按 MS-ASCAL schema 顺序"的说法未经验证，且 Coremail 对日历
+	// 上行一律 Status 5，任何顺序都无法在其上验证。
 	if draft.TimeZoneRaw != "" {
 		app.Children = append(app.Children, wbxml.E(wbxml.PageCalendar, "TimeZone",
 			wbxml.Text(draft.TimeZoneRaw)))
@@ -463,8 +465,39 @@ func buildEventApp(draft EventDraft) *wbxml.Element {
 		app.Children = append(app.Children, wbxml.E(wbxml.PageCalendar, "TimeZone",
 			wbxml.Text(draft.TimeZone.Encode())))
 	}
+	app.Children = append(app.Children,
+		wbxml.E(wbxml.PageCalendar, "DTStamp", wbxml.Text(formatEASTime(time.Now().UTC()))),
+	)
+	if !draft.StartTime.IsZero() {
+		app.Children = append(app.Children, wbxml.E(wbxml.PageCalendar, "StartTime", wbxml.Text(formatEASTime(draft.StartTime))))
+	}
+	if draft.Subject != "" {
+		app.Children = append(app.Children, wbxml.E(wbxml.PageCalendar, "Subject", wbxml.Text(draft.Subject)))
+	}
+	// EAS requires a UID for new events; updates must reuse the existing one.
+	uid := draft.UID
+	if uid == "" {
+		uid = newEventUID()
+	}
+	app.Children = append(app.Children, wbxml.E(wbxml.PageCalendar, "UID", wbxml.Text(uid)))
+	if draft.Location != "" {
+		app.Children = append(app.Children, wbxml.E(wbxml.PageCalendar, "Location", wbxml.Text(draft.Location)))
+	}
+	if !draft.EndTime.IsZero() {
+		app.Children = append(app.Children, wbxml.E(wbxml.PageCalendar, "EndTime", wbxml.Text(formatEASTime(draft.EndTime))))
+	}
+	if rec := recurrenceToWBXML(draft.Recurrence); rec != nil {
+		app.Children = append(app.Children, rec)
+	}
+	app.Children = append(app.Children,
+		wbxml.E(wbxml.PageCalendar, "Sensitivity", wbxml.Text(itoa(draft.Sensitivity))),
+		wbxml.E(wbxml.PageCalendar, "BusyStatus", wbxml.Text(itoa(draft.BusyStatus))),
+	)
 	if draft.AllDayEvent {
 		app.Children = append(app.Children, wbxml.E(wbxml.PageCalendar, "AllDayEvent", wbxml.Text("1")))
+	}
+	if draft.Reminder > 0 {
+		app.Children = append(app.Children, wbxml.E(wbxml.PageCalendar, "Reminder", wbxml.Text(itoa(draft.Reminder))))
 	}
 	if len(draft.Attendees) > 0 {
 		atts := wbxml.E(wbxml.PageCalendar, "Attendees")
@@ -488,20 +521,6 @@ func buildEventApp(draft EventDraft) *wbxml.Element {
 			),
 		)
 	}
-	app.Children = append(app.Children,
-		wbxml.E(wbxml.PageCalendar, "BusyStatus", wbxml.Text(itoa(draft.BusyStatus))),
-		wbxml.E(wbxml.PageCalendar, "Sensitivity", wbxml.Text(itoa(draft.Sensitivity))),
-		wbxml.E(wbxml.PageCalendar, "DTStamp", wbxml.Text(formatEASTime(time.Now().UTC()))),
-	)
-	if !draft.EndTime.IsZero() {
-		app.Children = append(app.Children, wbxml.E(wbxml.PageCalendar, "EndTime", wbxml.Text(formatEASTime(draft.EndTime))))
-	}
-	if draft.Location != "" {
-		app.Children = append(app.Children, wbxml.E(wbxml.PageCalendar, "Location", wbxml.Text(draft.Location)))
-	}
-	if rec := recurrenceToWBXML(draft.Recurrence); rec != nil {
-		app.Children = append(app.Children, rec)
-	}
 	if len(draft.Exceptions) > 0 {
 		exc := wbxml.E(wbxml.PageCalendar, "Exceptions")
 		for _, x := range draft.Exceptions {
@@ -509,21 +528,6 @@ func buildEventApp(draft EventDraft) *wbxml.Element {
 		}
 		app.Children = append(app.Children, exc)
 	}
-	if draft.Reminder > 0 {
-		app.Children = append(app.Children, wbxml.E(wbxml.PageCalendar, "Reminder", wbxml.Text(itoa(draft.Reminder))))
-	}
-	if !draft.StartTime.IsZero() {
-		app.Children = append(app.Children, wbxml.E(wbxml.PageCalendar, "StartTime", wbxml.Text(formatEASTime(draft.StartTime))))
-	}
-	if draft.Subject != "" {
-		app.Children = append(app.Children, wbxml.E(wbxml.PageCalendar, "Subject", wbxml.Text(draft.Subject)))
-	}
-	// EAS requires a UID for new events; updates must reuse the existing one.
-	uid := draft.UID
-	if uid == "" {
-		uid = newEventUID()
-	}
-	app.Children = append(app.Children, wbxml.E(wbxml.PageCalendar, "UID", wbxml.Text(uid)))
 	return app
 }
 

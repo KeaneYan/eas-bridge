@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/emersion/go-ical"
+	"github.com/emersion/go-webdav/caldav"
 	"github.com/hstern/go-activesync/eas"
 	"github.com/hstern/go-activesync/eas/easmock"
 )
@@ -280,5 +281,93 @@ END:VCALENDAR`
 	}
 	if gotDraft.StartTime.Day() != 1 || gotDraft.EndTime.Day() != 3 {
 		t.Fatalf("allday times = %v ~ %v", gotDraft.StartTime, gotDraft.EndTime)
+	}
+}
+
+// TestPutUnknownServerIDPathRejected：path 是服务器 ID 形态（含冒号）但本地
+// 没有该事件，且客户端未声明 If-None-Match——必须拒绝而不是当创建（ZCode B1）。
+func TestPutUnknownServerIDPathRejected(t *testing.T) {
+	called := false
+	mock := &easmock.Client{
+		CalendarClient: easmock.CalendarClient{
+			CreateEventFunc: func(_ context.Context, _ string, _ eas.EventDraft) (string, error) {
+				called = true
+				return "cal:x", nil
+			},
+		},
+	}
+	b := newCalWriteBackend(t, mock)
+	_, err := b.PutCalendarObject(context.Background(),
+		caldavCalendarPath+"Event%3ADEFAULT%3A999.ics", buildICal(t, testVEvent), nil)
+	if err == nil {
+		t.Fatal("应拒绝未知服务器 ID 路径的写入")
+	}
+	if called {
+		t.Fatal("不应调用 CreateEvent（会产生服务器重复事件）")
+	}
+}
+
+// TestPutCreateWithIfNoneMatch：客户端声明 If-None-Match 时按创建处理。
+func TestPutCreateWithIfNoneMatch(t *testing.T) {
+	mock := &easmock.Client{
+		CalendarClient: easmock.CalendarClient{
+			CreateEventFunc: func(_ context.Context, _ string, _ eas.EventDraft) (string, error) {
+				return "cal:100", nil
+			},
+		},
+	}
+	b := newCalWriteBackend(t, mock)
+	opts := &caldav.PutCalendarObjectOptions{IfNoneMatch: "*"}
+	if _, err := b.PutCalendarObject(context.Background(),
+		caldavCalendarPath+"new-uid-123.ics", buildICal(t, testVEvent), opts); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestEXDATEMultiValue：单条 EXDATE 携带逗号分隔多值（ZCode H1）。
+func TestEXDATEMultiValue(t *testing.T) {
+	body := `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:ex1
+SUMMARY:循环
+DTSTART:20260728T060000Z
+DTEND:20260728T070000Z
+RRULE:FREQ=WEEKLY;BYDAY=TU
+EXDATE:20260804T060000Z,20260811T060000Z,20260818T060000Z
+END:VEVENT
+END:VCALENDAR`
+	cal := buildICal(t, body)
+	d, _, err := icalEventToDraft(firstVEvent(cal), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d.Exceptions) != 3 {
+		t.Fatalf("Exceptions = %d, want 3: %+v", len(d.Exceptions), d.Exceptions)
+	}
+	if d.Exceptions[1].ExceptionStartTime.Day() != 11 {
+		t.Fatalf("第二个例外日期错误: %v", d.Exceptions[1].ExceptionStartTime)
+	}
+}
+
+// TestTZIDHonored：DTSTART 带 TZID 参数时按该时区解释（ZCode H2）。
+func TestTZIDHonored(t *testing.T) {
+	body := `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:tz1
+SUMMARY:时区
+DTSTART;TZID=America/New_York:20260728T140000
+DTEND;TZID=America/New_York:20260728T150000
+END:VEVENT
+END:VCALENDAR`
+	cal := buildICal(t, body)
+	d, _, err := icalEventToDraft(firstVEvent(cal), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 纽约 7 月 EDT = UTC-4，14:00 本地 → 18:00 UTC
+	if d.StartTime.Hour() != 18 {
+		t.Fatalf("TZID=New_York 14:00 应转 UTC 18:00, got %v", d.StartTime)
 	}
 }
