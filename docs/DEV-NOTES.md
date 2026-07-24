@@ -63,7 +63,7 @@ IMAP COPY 用 MoveItems 实现（移动语义，与 DavMail 一致）；APPEND �
 ## 三、架构不变量
 
 1. **IMAP UID 1-based 单调递增、持久化**（serverID↔UID 双向映射 + folderMeta.NextUID/UIDValidity）；UIDVALIDITY 恒定，state 重置才 bump（客户端会全量重下）。
-2. **synckey 前进必须落盘**（2026-07-24 修正）。"无变化不落盘"优化若连 key 也不落，重启后从过期落盘 key 恢复会被 Coremail 判失效回 Status 5——这正是当日事故的导火索之一。`syncMailOnce` 比较同步前后 key，不同则 `saveNow()`。
+2. **state 分片落盘**（2026-07-25 重构，原单文件 11.5MB 全量重写债）：`state.json` 主文件只存 DeviceID/PolicyKey/SyncKeys/Folders/FolderMeta（KB 级）；`folders/<fid>.json` 存 Items/UIDs/Deleted；`events.json` 存日历。落盘定向化：单封操作只写本文件夹分片，synckey 类只写主文件，syncMailOnce 用 `mutateFolder` 写两者。旧单文件格式首次加载自动迁移（迁移任一分片写失败必须中止，否则主文件瘦身后丢数据）。**synckey 前进必须落盘**（saveNow→主文件），失效 key 重启恢复会被 Coremail 判失效回 Status 5。
 3. **assignUIDs 按传入列表全量重建 UID 映射**——调用方必须传文件夹**全量** items（`addMovedItems` 曾只传增量，清空了目标文件夹原有 UID 映射；ZCode MEDIUM-3 实锤）。
 4. **缓存只存完整结果**：`complete=false` 不写缓存（服务器抖动不固化残缺邮件）。raw.eml 始终缓存。
 5. **只监听 localhost**；InsecureAuth 仅限此场景。config 被改成 0.0.0.0 要拒绝启动。
