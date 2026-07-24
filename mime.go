@@ -151,7 +151,7 @@ func fetchAndBuildMIME(ctx context.Context, c messageContentClient, folderID, se
 		}
 		attachments = append(attachments, mailAttachment{
 			meta:        meta,
-			data:        got.Data,
+			data:        decodeAttachmentData(got.Data, meta.EstimatedDataSize),
 			contentType: firstNonEmpty(meta.ContentType, got.ContentType),
 			index:       i,
 		})
@@ -170,6 +170,59 @@ func validRFC822(raw []byte) bool {
 	}
 	msg, err := mail.ReadMessage(bytes.NewReader(raw))
 	return err == nil && len(msg.Header) > 0
+}
+
+// decodeBase64Chunk 严格解码一段 base64（去空白）。用于附件分块等"确定是
+// base64"的场景——分块路径不存在"其实是原文"的歧义，故不做短输入保护。
+func decodeBase64Chunk(raw []byte) ([]byte, error) {
+	compact := make([]byte, 0, len(raw))
+	for _, b := range raw {
+		if b != '\r' && b != '\n' && b != ' ' && b != '	' {
+			compact = append(compact, b)
+		}
+	}
+	dec := make([]byte, base64.StdEncoding.DecodedLen(len(compact)))
+	n, err := base64.StdEncoding.Decode(dec, compact)
+	if err != nil {
+		return nil, err
+	}
+	return dec[:n], nil
+}
+
+// decodeAttachmentData 解码 FetchAttachment 返回的附件数据。
+// fork 库保持上游语义：Data 是未解码的 base64 原文（见 FORK-NOTES.md）。
+// 判定规则（与 webank-mail 保持一致）：
+//  1. 声明大小 EstimatedDataSize：解码后长度==声明大小 → 是 base64；原文长度==声明大小 → 是文本
+//  2. 无声明大小时：合法 canonical base64 且长度>=16 才解码（短输入按文本处理防误判）
+func decodeAttachmentData(raw []byte, declaredSize int64) []byte {
+	dec, err := decodeBase64Chunk(raw)
+	if err != nil {
+		return raw // 不是合法 base64，按原文
+	}
+	n := len(dec)
+	compactLen := 0
+	for _, b := range raw {
+		if b != '\r' && b != '\n' && b != ' ' && b != '	' {
+			compactLen++
+		}
+	}
+	if declaredSize > 0 {
+		if int64(n) == declaredSize {
+			return dec
+		}
+		if int64(len(raw)) == declaredSize {
+			return raw
+		}
+		// 声明大小对不上任何一边：仍按"更像 base64"处理（服务器大小字段是估计值）
+		if compactLen >= 16 {
+			return dec
+		}
+		return raw
+	}
+	if compactLen >= 16 {
+		return dec
+	}
+	return raw
 }
 
 func mergeEmailItem(base, fetched eas.EmailItem) eas.EmailItem {

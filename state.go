@@ -44,18 +44,18 @@ type stateMain struct {
 	Folders      []eas.Folder          `json:"folders"`
 	FolderMeta   map[string]folderMeta `json:"folder_meta"`
 
-	LegacyItems   map[string][]eas.EmailItem    `json:"items,omitempty"`
-	LegacyUIDs    map[string][]uidEntry         `json:"uids,omitempty"`
-	LegacyEvents  map[string]eas.EventItem      `json:"events,omitempty"`
-	LegacyDeleted map[string]map[string]bool    `json:"deleted,omitempty"`
+	LegacyItems   map[string][]eas.EmailItem `json:"items,omitempty"`
+	LegacyUIDs    map[string][]uidEntry      `json:"uids,omitempty"`
+	LegacyEvents  map[string]eas.EventItem   `json:"events,omitempty"`
+	LegacyDeleted map[string]map[string]bool `json:"deleted,omitempty"`
 }
 
 // folderShard 单文件夹分片。FolderID 冗余存储便于加载时还原键。
 type folderShard struct {
-	FolderID string                 `json:"folder_id"`
-	Items    []eas.EmailItem        `json:"items"`
-	UIDs     []uidEntry             `json:"uids"`
-	Deleted  map[string]bool        `json:"deleted,omitempty"`
+	FolderID string          `json:"folder_id"`
+	Items    []eas.EmailItem `json:"items"`
+	UIDs     []uidEntry      `json:"uids"`
+	Deleted  map[string]bool `json:"deleted,omitempty"`
 }
 
 // eventsShard 日历事件分片。

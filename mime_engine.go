@@ -297,15 +297,23 @@ func (e *syncEngine) fetchAttachmentCached(ctx context.Context, folderID, server
 	return value.([]byte), nil
 }
 
+// downloadAttachment 下载附件并返回解码后的原始字节。
+// fork 库保持上游语义：FetchAttachment 的 Data 是未解码的 base64 原文，
+// 解码统一在本函数内完成（缓存与下游拿到的都是原始字节）。
 func (e *syncEngine) downloadAttachment(ctx context.Context, meta eas.Attachment) ([]byte, error) {
 	if meta.EstimatedDataSize <= 2*attachmentChunkSize {
 		result, err := e.c.FetchAttachment(ctx, meta.FileReference, 0, 0)
 		if err != nil {
 			return nil, err
 		}
-		return result.Data, nil
+		return decodeAttachmentData(result.Data, meta.EstimatedDataSize), nil
 	}
 
+	// 大附件分块：Range 作用于原始字节（MS-ASCMD：附件的 range applies to
+	// the file content），但每个分块的 Data 是**独立** base64 编码（各自带
+	// padding）。必须逐块解码后拼接原始字节、按解码后长度推进偏移——直接
+	// 拼接 base64 文本会在流中间出现 padding 导致整体解码失败，按 base64
+	// 文本长度推进偏移则会跳过 ~1/3 内容（2026-07-25 ZCode B-1/H-1）。
 	var buf bytes.Buffer
 	for start := int64(0); start < meta.EstimatedDataSize; {
 		end := min(start+attachmentChunkSize-1, meta.EstimatedDataSize-1)
@@ -314,13 +322,18 @@ func (e *syncEngine) downloadAttachment(ctx context.Context, meta eas.Attachment
 			return nil, err
 		}
 		if result.Range == "" {
-			return result.Data, nil
+			// 服务器忽略 Range 直接返回完整附件
+			return decodeAttachmentData(result.Data, meta.EstimatedDataSize), nil
 		}
 		if len(result.Data) == 0 {
 			return nil, fmt.Errorf("附件分块 %d-%d 返回空数据", start, end)
 		}
-		buf.Write(result.Data)
-		start += int64(len(result.Data))
+		chunk, err := decodeBase64Chunk(result.Data)
+		if err != nil {
+			return nil, fmt.Errorf("附件分块 %d-%d base64 解码失败: %w", start, end, err)
+		}
+		buf.Write(chunk)
+		start += int64(len(chunk))
 	}
 	return buf.Bytes(), nil
 }

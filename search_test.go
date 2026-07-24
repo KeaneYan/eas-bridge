@@ -17,7 +17,7 @@ func newSearchFixture() *searchContext {
 		{ServerID: "m2", Subject: "团建通知", From: "HR <hr@webank.com>",
 			To: "all@webank.com", Cc: "keaneyan@webank.com",
 			DateReceived: time.Date(2026, 7, 22, 9, 0, 0, 0, time.UTC),
-			Read: false, BodyEstimatedSize: 2000, FlagStatus: 2},
+			Read:         false, BodyEstimatedSize: 2000, FlagStatus: 2},
 		{ServerID: "m3", Subject: "RE: 季度财报评审", From: "李四 <lisi@webank.com>",
 			To: "zhangsan@webank.com", DateReceived: time.Date(2026, 7, 23, 15, 0, 0, 0, time.UTC),
 			Read: false, BodyEstimatedSize: 8000},

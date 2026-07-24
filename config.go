@@ -9,13 +9,13 @@ import (
 )
 
 type config struct {
-	Server   string `json:"server"`
-	User     string `json:"user"`
-	Password string `json:"password"`
-	IMAPAddr  string `json:"imap_addr"`   // 监听地址，默认 "127.0.0.1:1143"
-	SMTPAddr  string `json:"smtp_addr"`   // 监听地址，默认 "127.0.0.1:1025"
-	CalDAVAddr string `json:"caldav_addr"` // 监听地址，默认 "127.0.0.1:8008"
-	PollSecs  int    `json:"poll_seconds"` // 邮件同步间隔，默认 60
+	Server     string `json:"server"`
+	User       string `json:"user"`
+	Password   string `json:"password"`
+	IMAPAddr   string `json:"imap_addr"`    // 监听地址，默认 "127.0.0.1:1143"
+	SMTPAddr   string `json:"smtp_addr"`    // 监听地址，默认 "127.0.0.1:1025"
+	CalDAVAddr string `json:"caldav_addr"`  // 监听地址，默认 "127.0.0.1:8008"
+	PollSecs   int    `json:"poll_seconds"` // 邮件同步间隔，默认 60
 }
 
 func configDir() string {
@@ -23,8 +23,8 @@ func configDir() string {
 	return filepath.Join(home, ".config", "eas-bridge")
 }
 
-func configPath() string { return filepath.Join(configDir(), "config.json") }
-func statePath() string  { return filepath.Join(configDir(), "state.json") }
+func configPath() string   { return filepath.Join(configDir(), "config.json") }
+func statePath() string    { return filepath.Join(configDir(), "state.json") }
 func mimeCacheDir() string { return filepath.Join(configDir(), "mimecache") }
 
 func loadConfig() (*config, error) {

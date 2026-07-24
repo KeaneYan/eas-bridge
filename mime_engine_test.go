@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -96,13 +98,19 @@ func TestMessagePlanFetchesOnlyRequestedAttachmentPart(t *testing.T) {
 
 func TestDownloadAttachmentUsesRangesForLargeFiles(t *testing.T) {
 	size := 2*attachmentChunkSize + 1
+	// 服务器对每个分块独立 base64 编码：Range 作用于原始字节，Data 是该
+	// 字节区间的 base64 文本（中间分块也各自带 padding——4MB 不被 3 整除）。
+	content := make([]byte, size)
+	for i := range content {
+		content[i] = byte(i * 31)
+	}
 	var ranges [][2]int64
 	engine := &syncEngine{c: &easmock.Client{
 		FolderClient: easmock.FolderClient{
 			FetchAttachmentFunc: func(_ context.Context, _ string, start, end int64) (*eas.FetchAttachmentResult, error) {
 				ranges = append(ranges, [2]int64{start, end})
 				return &eas.FetchAttachmentResult{
-					Data:  make([]byte, end-start+1),
+					Data:  []byte(base64.StdEncoding.EncodeToString(content[start : end+1])),
 					Range: fmt.Sprintf("%d-%d", start, end),
 				}, nil
 			},
@@ -116,11 +124,39 @@ func TestDownloadAttachmentUsesRangesForLargeFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if int64(len(got)) != size {
-		t.Fatalf("downloaded size = %d, want %d", len(got), size)
+	if !bytes.Equal(got, content) {
+		t.Fatalf("downloaded content mismatch: got %d bytes, want %d", len(got), size)
 	}
 	if len(ranges) != 3 {
 		t.Fatalf("range requests = %v, want 3 chunks", ranges)
+	}
+	// 偏移必须按解码后的原始字节推进（按 base64 文本推进会跳内容）
+	if ranges[1][0] != attachmentChunkSize {
+		t.Fatalf("second chunk start = %d, want %d", ranges[1][0], attachmentChunkSize)
+	}
+}
+
+// 服务器忽略 Range 直接返回完整附件（Range 为空）时也要解码。
+func TestDownloadAttachmentRangeIgnoredDecodesWhole(t *testing.T) {
+	payload := bytes.Repeat([]byte{1, 2, 3, 4, 5}, 100)
+	engine := &syncEngine{c: &easmock.Client{
+		FolderClient: easmock.FolderClient{
+			FetchAttachmentFunc: func(context.Context, string, int64, int64) (*eas.FetchAttachmentResult, error) {
+				return &eas.FetchAttachmentResult{
+					Data: []byte(base64.StdEncoding.EncodeToString(payload)),
+				}, nil
+			},
+		},
+	}}
+	got, err := engine.downloadAttachment(context.Background(), eas.Attachment{
+		FileReference:     "large",
+		EstimatedDataSize: 2*attachmentChunkSize + 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("got %d bytes, want %d", len(got), len(payload))
 	}
 }
 

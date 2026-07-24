@@ -334,3 +334,69 @@ func equalBodyTypes(a, b []eas.BodyType) bool {
 	}
 	return true
 }
+
+func TestDecodeAttachmentData(t *testing.T) {
+	png := []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3, 4, 5, 6, 7, 8}
+	b64 := base64.StdEncoding.EncodeToString(png)
+
+	// fork 库返回未解码 base64 原文 + 声明大小匹配解码结果 → 解码
+	if got := decodeAttachmentData([]byte(b64), int64(len(png))); !bytes.Equal(got, png) {
+		t.Fatalf("base64 with declared size: got %x", got)
+	}
+	// 带换行的 base64（Coremail 实测会折行）→ 解码
+	folded := b64[:12] + "\r\n" + b64[12:]
+	if got := decodeAttachmentData([]byte(folded), int64(len(png))); !bytes.Equal(got, png) {
+		t.Fatalf("folded base64: got %x", got)
+	}
+	// 原文长度 == 声明大小 → 按原文（已是二进制）
+	if got := decodeAttachmentData(png, int64(len(png))); !bytes.Equal(got, png) {
+		t.Fatalf("raw binary with declared size: got %x", got)
+	}
+	// 无声明大小 + 合法 base64 且 >=16 → 解码
+	if got := decodeAttachmentData([]byte(b64), 0); !bytes.Equal(got, png) {
+		t.Fatalf("base64 without declared size: got %x", got)
+	}
+	// 短输入一律按原文（"test" 也是合法 base64，防误判）
+	if got := decodeAttachmentData([]byte("test"), 0); string(got) != "test" {
+		t.Fatalf("short input: got %q", got)
+	}
+	// 非法 base64 按原文
+	raw := []byte("data:not-base64!!")
+	if got := decodeAttachmentData(raw, 0); !bytes.Equal(got, raw) {
+		t.Fatalf("invalid base64: got %q", got)
+	}
+}
+
+type base64AttachmentClient struct {
+	fakeMessageContentClient
+	payload []byte
+}
+
+func (c *base64AttachmentClient) FetchAttachment(_ context.Context, fileReference string, _, _ int64) (*eas.FetchAttachmentResult, error) {
+	c.attachments = append(c.attachments, fileReference)
+	return &eas.FetchAttachmentResult{
+		Data: []byte(base64.StdEncoding.EncodeToString(c.payload)),
+	}, nil
+}
+
+// 回归：fork 库 FetchAttachment 返回未解码 base64 原文，构建 MIME 时必须解码，
+// 否则写出双层 base64，客户端解一层后拿到文本而非图片（2026-07-25 图片全挂事故）。
+func TestFetchAndBuildMIMEDecodesBase64Attachment(t *testing.T) {
+	payload := bytes.Repeat([]byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}, 3) // PNG magic x3，base64 >=16 字符
+	client := &base64AttachmentClient{payload: payload}
+	got, complete := fetchAndBuildMIME(context.Background(), client, "inbox", "message-1", eas.EmailItem{
+		ServerID: "message-1",
+		From:     "sender@example.com",
+		To:       "receiver@example.com",
+	})
+	if !complete {
+		t.Fatal("complete = false, want true")
+	}
+	msg, err := mail.ReadMessage(bytes.NewReader(got))
+	if err != nil {
+		t.Fatalf("ReadMessage: %v", err)
+	}
+	leaves := collectLeaves(t, textproto.MIMEHeader(msg.Header), msg.Body)
+	assertLeaf(t, leaves, "image/png", "inline", "logo.png", payload)
+	assertLeaf(t, leaves, "application/pdf", "attachment", "报告.pdf", payload)
+}
