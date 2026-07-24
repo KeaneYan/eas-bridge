@@ -318,10 +318,12 @@ func (s *diskState) removeItems(folderID string, serverIDs ...string) error {
 // addMovedItems 把 MoveItems 移入的邮件追加到目标文件夹并分配 UID。
 // EAS 不回显本设备引起的变更（fork AGENTS.md 与实测均确认），目标文件夹的
 // 增量同步永远看不到这些邮件，必须由客户端自己落进本地 state。
+// 注意：assignUIDs 末尾会按传入列表全量重建 UID 映射，必须传文件夹全量
+// items（而非仅增量），否则该文件夹原有 UID 映射被清空（ZCode MEDIUM-3）。
 func (s *diskState) addMovedItems(dstFolder string, items []eas.EmailItem) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Items[dstFolder] = append(s.Items[dstFolder], items...)
-	s.assignUIDs(dstFolder, items)
+	s.Items[dstFolder] = s.assignUIDs(dstFolder, s.Items[dstFolder])
 	return s.saveLocked()
 }

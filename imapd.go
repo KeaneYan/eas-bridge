@@ -313,15 +313,30 @@ func (sess *imapSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, op
 	})
 }
 
-// flagMutation 记录一次 STORE 变更的邮件定位信息，供响应写回使用。
+// flagMutation 记录一次 STORE 变更的邮件定位与结果 flags，供响应写回使用。
 type flagMutation struct {
 	seqNum   uint32
 	uid      uint32
 	serverID string
+	flags    []imap.Flag
+}
+
+// flagsFrom 按已读/删除标记构造 flags 列表。
+func flagsFrom(read, deleted bool) []imap.Flag {
+	var flags []imap.Flag
+	if read {
+		flags = append(flags, "\\Seen")
+	}
+	if deleted {
+		flags = append(flags, "\\Deleted")
+	}
+	return flags
 }
 
 // applyFlagMutations 应用 STORE 的 \Seen/\Deleted 变更到本地 state，
 // 返回需要回推服务器的已读变更与写回定位。失败即中止，已应用的不回滚。
+// 结果 flags 在本函数内随变更一并算出，避免写回时二次加锁 O(n) 查找，
+// 也避免查找落空写出空 flags（ZCode HIGH-1）。
 func (sess *imapSession) applyFlagMutations(numSet imap.NumSet, storeFlags *imap.StoreFlags) ([]eas.EmailChange, []flagMutation, error) {
 	snap := sess.snap
 	st := sess.d.engine.st
@@ -329,6 +344,8 @@ func (sess *imapSession) applyFlagMutations(numSet imap.NumSet, storeFlags *imap
 	var mutated []flagMutation
 	err := forEachItem(numSet, snap, func(seqNum uint32, item eas.EmailItem) error {
 		serverID := item.ServerID
+		read := item.Read
+		deleted := snap.deleted[serverID]
 		for _, f := range storeFlags.Flags {
 			switch f {
 			case "\\Seen":
@@ -337,11 +354,13 @@ func (sess *imapSession) applyFlagMutations(numSet imap.NumSet, storeFlags *imap
 					if err := st.markRead(sess.selected, serverID); err != nil {
 						return err
 					}
+					read = true
 					readChanges = append(readChanges, eas.EmailChange{ServerID: serverID, Read: boolPtr(true)})
 				case imap.StoreFlagsDel:
 					if err := st.markUnread(sess.selected, serverID); err != nil {
 						return err
 					}
+					read = false
 					readChanges = append(readChanges, eas.EmailChange{ServerID: serverID, Read: boolPtr(false)})
 				}
 			case "\\Deleted":
@@ -350,14 +369,21 @@ func (sess *imapSession) applyFlagMutations(numSet imap.NumSet, storeFlags *imap
 					if err := st.setDeleted(sess.selected, serverID, true); err != nil {
 						return err
 					}
+					deleted = true
 				case imap.StoreFlagsDel:
 					if err := st.setDeleted(sess.selected, serverID, false); err != nil {
 						return err
 					}
+					deleted = false
 				}
 			}
 		}
-		mutated = append(mutated, flagMutation{seqNum: seqNum, uid: snap.uidForSID[serverID], serverID: serverID})
+		mutated = append(mutated, flagMutation{
+			seqNum:   seqNum,
+			uid:      snap.uidForSID[serverID],
+			serverID: serverID,
+			flags:    flagsFrom(read, deleted),
+		})
 		return nil
 	})
 	return readChanges, mutated, err
@@ -385,21 +411,10 @@ func (sess *imapSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, st
 		return err
 	}
 
-	st := sess.d.engine.st
 	for _, m := range mutated {
 		rw := w.CreateMessage(m.seqNum)
 		rw.WriteUID(imap.UID(m.uid))
-		// 读回最新 flags（markRead/Unread/setDeleted 已改内存）
-		st.mu.Lock()
-		var flags []imap.Flag
-		for _, it := range st.Items[sess.selected] {
-			if it.ServerID == m.serverID {
-				flags = itemFlags(it, st.Deleted[sess.selected][m.serverID])
-				break
-			}
-		}
-		st.mu.Unlock()
-		rw.WriteFlags(flags)
+		rw.WriteFlags(m.flags)
 		if err := rw.Close(); err != nil {
 			return err
 		}
@@ -754,14 +769,7 @@ func parseEASAddrs(raw string) []imap.Address {
 }
 
 func itemFlags(item eas.EmailItem, deleted bool) []imap.Flag {
-	var flags []imap.Flag
-	if item.Read {
-		flags = append(flags, "\\Seen")
-	}
-	if deleted {
-		flags = append(flags, "\\Deleted")
-	}
-	return flags
+	return flagsFrom(item.Read, deleted)
 }
 
 func boolPtr(v bool) *bool { return &v }

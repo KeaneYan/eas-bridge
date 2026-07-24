@@ -290,6 +290,10 @@ func TestCopyMovesToDestFolder(t *testing.T) {
 		},
 	}
 	engine := newMutationTestEngine(t, mock)
+	// 目标文件夹预置一封邮件，验证 addMovedItems 不会清空其 UID 映射（MEDIUM-3 回归）
+	engine.st.Items["archive"] = []eas.EmailItem{{ServerID: "pre-existing", Subject: "旧"}}
+	engine.st.UIDs["archive"] = []uidEntry{{ServerID: "pre-existing", UID: 41}}
+	engine.st.FolderMeta["archive"] = folderMeta{NextUID: 42, UIDValidity: 9}
 	sess := newMutationSession(engine)
 	if _, err := sess.Copy(uidSetOf(1), "Archive"); err != nil {
 		t.Fatal(err)
@@ -304,8 +308,21 @@ func TestCopyMovesToDestFolder(t *testing.T) {
 	}
 	// EAS 不回显本设备变更：目标文件夹必须本地落库移入的邮件
 	arch := engine.st.Items["archive"]
-	if len(arch) != 1 || arch[0].ServerID != "archive:m1" || arch[0].Subject != "一" {
+	if len(arch) != 2 || arch[1].ServerID != "archive:m1" || arch[1].Subject != "一" {
 		t.Fatalf("archive items = %+v", arch)
+	}
+	// MEDIUM-3 回归：目标文件夹原有邮件的 UID 映射不得被清空
+	if arch[0].ServerID != "pre-existing" {
+		t.Fatalf("pre-existing item lost: %+v", arch)
+	}
+	var preUID uint32
+	for _, e := range engine.st.UIDs["archive"] {
+		if e.ServerID == "pre-existing" {
+			preUID = e.UID
+		}
+	}
+	if preUID != 41 {
+		t.Fatalf("pre-existing UID = %d, want 41 (映射被重建清空)", preUID)
 	}
 }
 
