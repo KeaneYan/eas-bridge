@@ -167,12 +167,17 @@ func loadState(path string) (*diskState, error) {
 
 	s.normalize()
 
-	// 4. 迁移落地：把旧格式内容写入分片，主文件重写为无 legacy 的小文件
+	// 4. 迁移落地：把旧格式内容写入分片，主文件重写为无 legacy 的小文件。
+	// 任一分片写失败必须中止——否则主文件瘦身后 legacy 数据永久丢失（ZCode M2）。
 	if legacy {
 		for fid := range s.Items {
-			_ = s.saveFolderLocked(fid)
+			if err := s.saveFolderLocked(fid); err != nil {
+				return nil, fmt.Errorf("迁移分片 %s 失败: %w", fid, err)
+			}
 		}
-		_ = s.saveEventsLocked()
+		if err := s.saveEventsLocked(); err != nil {
+			return nil, fmt.Errorf("迁移 events.json 失败: %w", err)
+		}
 		if err := s.saveMainLocked(); err != nil {
 			return nil, fmt.Errorf("迁移 state.json 分片失败: %w", err)
 		}
