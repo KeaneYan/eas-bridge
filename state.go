@@ -327,3 +327,20 @@ func (s *diskState) addMovedItems(dstFolder string, items []eas.EmailItem) error
 	s.Items[dstFolder] = s.assignUIDs(dstFolder, s.Items[dstFolder])
 	return s.saveLocked()
 }
+
+// upsertEvent 写入/更新日历事件（CalDAV 写操作后本地落库）。
+// EAS 不回显本设备变更，与 addMovedItems 同理必须自行落库。
+func (s *diskState) upsertEvent(ev eas.EventItem) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Events[ev.ServerID] = ev
+	return s.saveLocked()
+}
+
+// deleteEvent 删除日历事件（CalDAV DELETE 后本地落库）。
+func (s *diskState) deleteEvent(serverID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.Events, serverID)
+	return s.saveLocked()
+}

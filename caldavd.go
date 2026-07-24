@@ -112,13 +112,7 @@ func (b *caldavBackend) QueryCalendarObjects(ctx context.Context, path string, q
 	return caldav.Filter(query, b.allObjects())
 }
 
-func (b *caldavBackend) PutCalendarObject(ctx context.Context, path string, calendar *ical.Calendar, opts *caldav.PutCalendarObjectOptions) (*caldav.CalendarObject, error) {
-	return nil, errCalDAVReadOnly("PutCalendarObject")
-}
-
-func (b *caldavBackend) DeleteCalendarObject(ctx context.Context, path string) error {
-	return errCalDAVReadOnly("DeleteCalendarObject")
-}
+// PutCalendarObject / DeleteCalendarObject 的写路径实现在 caldav_write.go。
 
 // ---------- 内部 ----------
 

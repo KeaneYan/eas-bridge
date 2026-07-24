@@ -270,6 +270,18 @@ func (e *syncEngine) syncCalendar(ctx context.Context) error {
 	return err
 }
 
+// calendarFolderID 返回服务器日历文件夹 ID。
+func (e *syncEngine) calendarFolderID() (string, error) {
+	e.st.mu.Lock()
+	defer e.st.mu.Unlock()
+	for _, f := range e.st.Folders {
+		if f.Type == eas.FolderTypeCalendar {
+			return f.ServerID, nil
+		}
+	}
+	return "", fmt.Errorf("服务器没有日历文件夹")
+}
+
 func (e *syncEngine) syncCalendarOnce(ctx context.Context) error {
 	e.st.mu.Lock()
 	var calFolderID string
