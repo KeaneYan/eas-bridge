@@ -115,29 +115,51 @@ func (e *syncEngine) syncMail(ctx context.Context, folderID string) error {
 }
 
 func (e *syncEngine) syncMailOnce(ctx context.Context, folderID string) error {
-	res, err := e.c.SyncEmail(ctx, folderID, eas.EmailSyncOptions{
-		WindowSize: 200,
-		BodyType:   eas.BodyTypePlain,
-	})
-	if err != nil {
-		return err
+	// EAS Sync 按 WindowSize 分页，单页最多 200 封；MoreAvailable 时必须翻页拉完，
+	// 否则超过 200 封的文件夹只能看到最新的一页（老邮件不可见）。
+	// 中途出错时先落盘已拉到的页（synckey 按页持久化，下次从断点续拉），再返回错误。
+	var added, changed []eas.EmailItem
+	var deleted []string
+	var syncErr error
+	for page := 0; ; page++ {
+		if page >= 500 {
+			syncErr = fmt.Errorf("邮件同步超过 500 页仍未完成")
+			break
+		}
+		res, err := e.c.SyncEmail(ctx, folderID, eas.EmailSyncOptions{
+			WindowSize: 200,
+			BodyType:   eas.BodyTypePlain,
+			// Coremail 把 FilterType=0（协议未定义值）当作默认短窗口（实测只回最近 ~2 周），
+			// 显式指定 6 个月窗口——这是 EAS 协议支持的最大范围。
+			DateFilter: eas.FilterSixMonth,
+		})
+		if err != nil {
+			syncErr = err
+			break
+		}
+		added = append(added, res.Added...)
+		changed = append(changed, res.Changed...)
+		deleted = append(deleted, res.Deleted...)
+		if !res.MoreAvailable {
+			break
+		}
 	}
-	invalidated := make([]string, 0, len(res.Added)+len(res.Changed)+len(res.Deleted))
-	err = e.st.mutate(func() {
+	invalidated := make([]string, 0, len(added)+len(changed)+len(deleted))
+	err := e.st.mutate(func() {
 		existing := map[string]eas.EmailItem{}
-		order := make([]string, 0, len(e.st.Items[folderID])+len(res.Added))
+		order := make([]string, 0, len(e.st.Items[folderID])+len(added))
 		for _, it := range e.st.Items[folderID] {
 			existing[it.ServerID] = it
 			order = append(order, it.ServerID)
 		}
-		for _, it := range res.Added {
+		for _, it := range added {
 			if _, exists := existing[it.ServerID]; !exists {
 				order = append(order, it.ServerID)
 			}
 			existing[it.ServerID] = it
 			invalidated = append(invalidated, it.ServerID)
 		}
-		for _, it := range res.Changed {
+		for _, it := range changed {
 			before := existing[it.ServerID]
 			if _, exists := existing[it.ServerID]; !exists {
 				order = append(order, it.ServerID)
@@ -149,7 +171,7 @@ func (e *syncEngine) syncMailOnce(ctx context.Context, folderID string) error {
 			}
 		}
 		deletedIDs := map[string]bool{}
-		for _, id := range res.Deleted {
+		for _, id := range deleted {
 			deletedIDs[id] = true
 			invalidated = append(invalidated, id)
 		}
@@ -166,7 +188,8 @@ func (e *syncEngine) syncMailOnce(ctx context.Context, folderID string) error {
 		return err
 	}
 	e.invalidateMessageCache(folderID, invalidated...)
-	return nil
+	// 已拉取的页已安全落盘；把翻页中途的错误（如有）返回给调用方记日志
+	return syncErr
 }
 
 // mergeEmailChange 保留 EAS Change 未携带的邮件字段。
