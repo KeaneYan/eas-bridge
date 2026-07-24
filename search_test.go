@@ -223,3 +223,38 @@ func TestExtractSearchableText(t *testing.T) {
 		t.Fatalf("HTML 提取: %q", got)
 	}
 }
+
+// TestExtractNestedMultipart：嵌套 multipart（mixed→alternative→plain/html）
+// 的正文必须被递归提取（ZCode M1 修复验证）。
+func TestExtractNestedMultipart(t *testing.T) {
+	raw := []byte("Content-Type: multipart/mixed; boundary=OUT\r\n" +
+		"\r\n" +
+		"--OUT\r\n" +
+		"Content-Type: multipart/alternative; boundary=IN\r\n" +
+		"\r\n" +
+		"--IN\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n" +
+		"\r\n" +
+		"嵌套纯文本正文关键词甲\r\n" +
+		"--IN\r\n" +
+		"Content-Type: text/html\r\n" +
+		"\r\n" +
+		"<p>嵌套<b>网页</b>正文关键词乙</p>\r\n" +
+		"--IN--\r\n" +
+		"--OUT\r\n" +
+		"Content-Type: application/pdf\r\n" +
+		"Content-Transfer-Encoding: base64\r\n" +
+		"\r\n" +
+		"JVBERi0xLjQ=\r\n" +
+		"--OUT--\r\n")
+	text := extractSearchableText(raw)
+	if !containsFold(text, "关键词甲") {
+		t.Fatalf("嵌套 plain 未提取: %q", text)
+	}
+	if !containsFold(text, "嵌套网页正文关键词乙") {
+		t.Fatalf("嵌套 html 未提取: %q", text)
+	}
+	if containsFold(text, "JVBERi") {
+		t.Fatalf("附件不应进入正文: %q", text)
+	}
+}

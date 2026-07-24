@@ -216,16 +216,32 @@ func extractSearchableText(raw []byte) string {
 		sb.WriteString(string(raw))
 		return sb.String()
 	}
+	extractPartText(&sb, mediaType, params, msg.Body, msg.Header.Get("Content-Transfer-Encoding"), 0)
+	return sb.String()
+}
+
+// extractPartText 递归遍历 MIME 树提取文本（深度上限 10 防畸形嵌套）。
+func extractPartText(sb *strings.Builder, mediaType string, params map[string]string, body io.Reader, cte string, depth int) {
+	if depth > 10 {
+		return
+	}
 	if strings.HasPrefix(mediaType, "multipart/") {
-		mr := multipart.NewReader(msg.Body, params["boundary"])
+		mr := multipart.NewReader(body, params["boundary"])
 		for {
 			part, err := mr.NextPart()
 			if err != nil {
 				break
 			}
 			ct := part.Header.Get("Content-Type")
-			mt, _, _ := mime.ParseMediaType(ct)
-			if mt != "text/plain" && mt != "text/html" && mt != "" {
+			mt, pp, _ := mime.ParseMediaType(ct)
+			if mt == "" {
+				mt = "text/plain" // 无 Content-Type 的 part 按 RFC 2046 默认 text/plain
+			}
+			if strings.HasPrefix(mt, "multipart/") {
+				extractPartText(sb, mt, pp, part, part.Header.Get("Content-Transfer-Encoding"), depth+1)
+				continue
+			}
+			if mt != "text/plain" && mt != "text/html" {
 				continue
 			}
 			data, err := io.ReadAll(io.LimitReader(part, 1<<20))
@@ -239,15 +255,14 @@ func extractSearchableText(raw []byte) string {
 			sb.WriteString(text)
 			sb.WriteByte('\n')
 		}
-	} else {
-		data, _ := io.ReadAll(io.LimitReader(msg.Body, 1<<20))
-		text := decodeTransfer(data, msg.Header.Get("Content-Transfer-Encoding"))
-		if mediaType == "text/html" {
-			text = stripHTMLTags(text)
-		}
-		sb.WriteString(text)
+		return
 	}
-	return sb.String()
+	data, _ := io.ReadAll(io.LimitReader(body, 1<<20))
+	text := decodeTransfer(data, cte)
+	if mediaType == "text/html" {
+		text = stripHTMLTags(text)
+	}
+	sb.WriteString(text)
 }
 
 func decodeTransfer(data []byte, encoding string) string {
