@@ -129,6 +129,9 @@ func (e *syncEngine) syncMailOnce(ctx context.Context, folderID string) error {
 		res, err := e.c.SyncEmail(ctx, folderID, eas.EmailSyncOptions{
 			WindowSize: 200,
 			BodyType:   eas.BodyTypePlain,
+			// Coremail 把 FilterType=0（协议未定义值）当作默认短窗口（实测只回最近 ~2 周），
+			// 显式指定 6 个月窗口——这是 EAS 协议支持的最大范围。
+			DateFilter: eas.FilterSixMonth,
 		})
 		if err != nil {
 			syncErr = err
