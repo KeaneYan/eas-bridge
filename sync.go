@@ -1,16 +1,13 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/hstern/go-activesync/eas"
@@ -167,27 +164,17 @@ func (e *syncEngine) findFolder(folderID string) (eas.Folder, bool) {
 }
 
 // fetchMIME 从缓存或服务器拉取完整 RFC822 消息。
-// Coremail EAS 对纯文本邮件不返回 BodyMIME（已知怪癖），此时用 EAS 元数据构造。
+// Coremail 可能不返回 BodyMIME，此时改取完整 HTML 正文和附件并重建 MIME。
 func (e *syncEngine) fetchMIME(ctx context.Context, folderID, serverID string) ([]byte, error) {
 	dir, err := ensureMIMECacheDir(folderID)
 	if err != nil {
 		return nil, err
 	}
-	cachePath := filepath.Join(dir, serverID+".eml")
+	cachePath := filepath.Join(dir, mimeCacheFilename(serverID))
 	if b, err := os.ReadFile(cachePath); err == nil && len(b) > 10 {
 		return b, nil
 	}
 
-	// 尝试从服务器拉 MIME
-	f, ok := e.findFolder(folderID)
-	if ok {
-		if it, ferr := e.c.FetchEmail(ctx, f.ServerID, serverID, eas.FetchEmailOptions{BodyType: eas.BodyTypeMIME}); ferr == nil && len(it.BodyMIME) > 10 {
-			_ = os.WriteFile(cachePath, it.BodyMIME, 0600)
-			return it.BodyMIME, nil
-		}
-	}
-
-	// 降级：从 EAS 元数据构造 RFC822 消息
 	e.st.mu.Lock()
 	var item eas.EmailItem
 	for _, it := range e.st.Items[folderID] {
@@ -197,50 +184,18 @@ func (e *syncEngine) fetchMIME(ctx context.Context, folderID, serverID string) (
 		}
 	}
 	e.st.mu.Unlock()
-	b := constructRFC822(item)
-	if len(b) > 0 {
-		_ = os.WriteFile(cachePath, b, 0600)
+
+	f, ok := e.findFolder(folderID)
+	if !ok {
+		return nil, fmt.Errorf("不存在的文件夹: %s", folderID)
+	}
+	b, complete := fetchAndBuildMIME(ctx, e.c, f.ServerID, serverID, item)
+	if complete && len(b) > 0 {
+		if err := os.WriteFile(cachePath, b, 0600); err != nil {
+			log.Printf("[mime] 写缓存失败: %v", err)
+		}
 	}
 	return b, nil
-}
-
-// constructRFC822 从 EAS 元数据构造最小合法 RFC822 消息。
-// H3 修复：所有 header 值先剥 CR/LF，防 header 注入。
-func constructRFC822(item eas.EmailItem) []byte {
-	sanitize := func(v string) string {
-		return strings.NewReplacer("\r", " ", "\n", " ").Replace(v)
-	}
-	var buf bytes.Buffer
-	writeHeader := func(k, v string) {
-		if v != "" {
-			fmt.Fprintf(&buf, "%s: %s\r\n", k, sanitize(v))
-		}
-	}
-	writeHeader("From", item.From)
-	writeHeader("To", item.To)
-	writeHeader("Cc", item.Cc)
-	writeHeader("Subject", item.Subject)
-	if !item.DateReceived.IsZero() {
-		fmt.Fprintf(&buf, "Date: %s\r\n", item.DateReceived.Format("Mon, 02 Jan 2006 15:04:05 -0700"))
-	}
-	buf.WriteString("MIME-Version: 1.0\r\n")
-	buf.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
-	buf.WriteString("Content-Transfer-Encoding: base64\r\n")
-	buf.WriteString("\r\n")
-	body := item.Body
-	if body == "" {
-		body = "(no body)"
-	}
-	encoded := base64.StdEncoding.EncodeToString([]byte(body))
-	for i := 0; i < len(encoded); i += 76 {
-		end := i + 76
-		if end > len(encoded) {
-			end = len(encoded)
-		}
-		buf.WriteString(encoded[i:end])
-		buf.WriteString("\r\n")
-	}
-	return buf.Bytes()
 }
 
 // syncCalendar 增量同步日历事件到 st.Events（synckey 由库自动持久化）。

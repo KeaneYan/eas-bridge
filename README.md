@@ -15,8 +15,9 @@ Apple 日历 ─CalDAV :8008──┘
 - **CalDAV**（默认 `127.0.0.1:8008`）：日历只读桥——Basic Auth、calendar-query time-range 过滤、**循环事件 RRULE 原生透传**（客户端自行展开）、VALARM 提醒、组织者/参与人、全天事件、取消状态
 - **增量同步**：EAS Sync 增量拉取，默认 60s 轮询收件箱；日历 60s TTL 门控（查询驱动）
 - **UID 稳定映射**：serverID ↔ IMAP UID 持久化，1-based 单调递增，UIDVALIDITY 时间戳（state 重置自动升位）
+- **完整邮件呈现**：优先透传原始 MIME；Coremail 不返回 MIME 时自动用 HTML 正文、内嵌图片和普通附件重建标准 multipart 邮件
 - **安全**：只绑回环地址（非回环拒绝启动）；凭据仅本地 config，0600 权限
-- **Coremail 兼容**：纯文本邮件 EAS 不返回 MIME 时，自动用元数据构造合法 RFC822
+- **Coremail 兼容**：EAS 不返回原始 MIME 时，自动降级请求 HTML/纯文本并构造合法 RFC822
 
 ## 快速开始
 
@@ -80,12 +81,10 @@ go build -o eas-bridge .
 - SEARCH 只支持 ALL / UNSEEN
 - 已读状态只改本地，不回推服务器
 - 只轮询收件箱
-- Coremail 纯文本降级路径只构造 text/plain 正文（HTML 邮件暂走 EAS MIME，若服务器返回则原样透传）
 - **日历只读**（PUT/DELETE 返回 403）；修改型循环例外（Exceptions 非 Deleted）暂忽略
 
 ## Roadmap
 
-- HTML 邮件正文降级构造
 - 删除/移动映射到 EAS MoveItems
 - 已读回推（EAS Sync Change）
 - 日历写操作（EAS CreateEvent/UpdateEvent/DeleteEvent）
