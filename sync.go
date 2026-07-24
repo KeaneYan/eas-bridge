@@ -271,35 +271,39 @@ func (e *syncEngine) syncCalendarOnce(ctx context.Context) error {
 	return fmt.Errorf("日历同步超过 100 页仍未完成")
 }
 
+// mailFolderIDs 返回当前所有可同步邮件文件夹的 ServerID（每轮重新读，新文件夹自动纳入）。
+// 基于 isMailFolderType（folders.go）。
+func (e *syncEngine) mailFolderIDs() []string {
+	e.st.mu.Lock()
+	defer e.st.mu.Unlock()
+	var ids []string
+	for _, f := range e.st.Folders {
+		if isMailFolderType(f.Type) {
+			ids = append(ids, f.ServerID)
+		}
+	}
+	return ids
+}
+
 func (e *syncEngine) poller(ctx context.Context, interval time.Duration, onChange func(folderID string)) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	// 只轮询收件箱（邮件文件夹），跳过日历/联系人等非邮件文件夹避免 SyncEmail 报错
-	inboxID := ""
-	e.st.mu.Lock()
-	for _, f := range e.st.Folders {
-		if f.Type == eas.FolderTypeInbox {
-			inboxID = f.ServerID
-			break
-		}
-	}
-	e.st.mu.Unlock()
-	if inboxID == "" {
-		return
-	}
+	// 轮询所有邮件文件夹（每轮重读列表），跳过日历/联系人等非邮件文件夹避免 SyncEmail 报错
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := e.syncMail(ctx, inboxID); err != nil {
-				// 临时网络错误静默，持续错误会记日志但不崩溃
-				if !errors.Is(err, context.Canceled) {
-					log.Printf("[poll] syncMail inbox: %v", err)
+			for _, fid := range e.mailFolderIDs() {
+				if err := e.syncMail(ctx, fid); err != nil {
+					// 单文件夹失败不影响其他文件夹；临时网络错误静默，持续错误记日志但不崩溃
+					if !errors.Is(err, context.Canceled) {
+						log.Printf("[poll] syncMail %s: %v", fid, err)
+					}
+					continue
 				}
-				continue
+				onChange(fid)
 			}
-			onChange(inboxID)
 		}
 	}
 }

@@ -13,7 +13,7 @@ Apple 日历 ─CalDAV :8008──┘
 - **IMAP**（默认 `127.0.0.1:1143`）：LIST / SELECT / FETCH（ENVELOPE·FLAGS·BODY[]）/ STORE \Seen / SEARCH UNSEEN / IDLE+NOOP 新邮件推送
 - **SMTP**（默认 `127.0.0.1:1025`）：AUTH PLAIN，MIME 原样透传到 EAS SendMail（服务器自动存已发送）
 - **CalDAV**（默认 `127.0.0.1:8008`）：日历只读桥——Basic Auth、calendar-query time-range 过滤、**循环事件 RRULE 原生透传**（客户端自行展开）、VALARM 提醒、组织者/参与人、全天事件、取消状态
-- **增量同步**：EAS Sync 增量拉取，默认 60s 轮询收件箱；邮件与日历后台预热，日历缓存过期后异步刷新
+- **增量同步**：EAS Sync 增量拉取，默认 60s 轮询全部邮件文件夹（每轮重读列表，新文件夹自动纳入）；邮件与日历后台预热，日历缓存过期后异步刷新
 - **UID 稳定映射**：serverID ↔ IMAP UID 持久化，1-based 单调递增，UIDVALIDITY 时间戳（state 重置自动升位）
 - **完整邮件呈现**：优先透传原始 MIME；Coremail 不返回 MIME 时自动用纯文本 + HTML、内嵌图片和普通附件重建标准 multipart 邮件
 - **按需附件与缓存**：LIST / BODYSTRUCTURE / RFC822.SIZE 不预下载已知大小的附件，读取单个 MIME part 时只取对应附件；缓存采用并发去重、原子写入及 1 GiB / 30 天淘汰策略
