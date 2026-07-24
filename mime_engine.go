@@ -333,13 +333,23 @@ func (e *syncEngine) invalidateMessageCache(folderID string, serverIDs ...string
 	}
 }
 
+// scheduleCachePrune 启动时立即修剪一次，之后每 24h 定期修剪，
+// 避免长运行 daemon 的 MIME 缓存在重启间隔内无界增长。
 func (e *syncEngine) scheduleCachePrune() {
 	go func() {
-		_, err := e.flights.Do("cache-prune", func() (any, error) {
-			return nil, pruneMIMECache(time.Now())
-		})
-		if err != nil {
-			log.Printf("[mime] 清理缓存失败: %v", err)
+		prune := func() {
+			_, err := e.flights.Do("cache-prune", func() (any, error) {
+				return nil, pruneMIMECache(time.Now())
+			})
+			if err != nil {
+				log.Printf("[mime] 清理缓存失败: %v", err)
+			}
+		}
+		prune()
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			prune()
 		}
 	}()
 }

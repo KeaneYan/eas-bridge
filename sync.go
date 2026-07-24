@@ -83,6 +83,9 @@ func (e *syncEngine) syncFolders(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if len(res.Added) == 0 && len(res.Updated) == 0 && len(res.Deleted) == 0 {
+		return nil // 无变更不落盘，避免每轮启动/同步都重写 state.json
+	}
 	return e.st.mutate(func() {
 		byID := map[string]eas.Folder{}
 		for _, f := range e.st.Folders {
@@ -143,6 +146,11 @@ func (e *syncEngine) syncMailOnce(ctx context.Context, folderID string) error {
 		if !res.MoreAvailable {
 			break
 		}
+	}
+	// 无变更：不落盘、不失效缓存。内存中的新 synckey 暂不持久化——
+	// 崩溃后从上次落盘的 key 重拉，merge 按 serverID 幂等，无丢失风险。
+	if len(added) == 0 && len(changed) == 0 && len(deleted) == 0 {
+		return syncErr
 	}
 	invalidated := make([]string, 0, len(added)+len(changed)+len(deleted))
 	err := e.st.mutate(func() {
