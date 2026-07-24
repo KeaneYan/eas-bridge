@@ -200,6 +200,18 @@ func (e *syncEngine) syncMailOnce(ctx context.Context, folderID string) error {
 	return syncErr
 }
 
+// trashFolderID 返回服务器"已删除"文件夹（EAS DeletesAsMoves 目标）。
+func (e *syncEngine) trashFolderID() (string, error) {
+	e.st.mu.Lock()
+	defer e.st.mu.Unlock()
+	for _, f := range e.st.Folders {
+		if f.Type == eas.FolderTypeDeletedItems {
+			return f.ServerID, nil
+		}
+	}
+	return "", fmt.Errorf("服务器没有已删除文件夹")
+}
+
 // mergeEmailChange 保留 EAS Change 未携带的邮件字段。
 // 大多数服务器的 Change 是稀疏增量（常见只有 Read/Flag），直接替换会丢失主题、
 // 发件人、正文摘要和附件元数据。

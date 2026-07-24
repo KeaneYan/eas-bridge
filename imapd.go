@@ -82,9 +82,10 @@ type imapSession struct {
 
 type mboxSnapshot struct {
 	items       []eas.EmailItem
-	uidForSID   map[string]uint32 // serverID→UID
-	sidForUID   map[uint32]string // UID→serverID
+	uidForSID   map[string]uint32
+	sidForUID   map[uint32]string
 	uidValidity uint32
+	deleted     map[string]bool // serverID → 已标记 \Deleted
 }
 
 func (sess *imapSession) Close() error {
@@ -226,11 +227,11 @@ func (sess *imapSession) Select(mailbox string, options *imap.SelectOptions) (*i
 		}
 	}
 	sess.selected = folder.ServerID
-	sess.snap = &mboxSnapshot{items: items, uidForSID: uidForSID, sidForUID: sidForUID, uidValidity: fm.UIDValidity}
+	sess.snap = &mboxSnapshot{items: items, uidForSID: uidForSID, sidForUID: sidForUID, uidValidity: fm.UIDValidity, deleted: snapshotDeleted(st, folder.ServerID)}
 
 	return &imap.SelectData{
-		Flags:             []imap.Flag{"\\Seen", "\\Flagged"},
-		PermanentFlags:    []imap.Flag{"\\Seen", "\\Flagged"},
+		Flags:             []imap.Flag{"\\Seen", "\\Flagged", "\\Deleted"},
+		PermanentFlags:    []imap.Flag{"\\Seen", "\\Flagged", "\\Deleted"},
 		NumMessages:       uint32(len(items)),
 		FirstUnseenSeqNum: firstUnseenSeq,
 		UIDValidity:       fm.UIDValidity,
@@ -264,7 +265,7 @@ func (sess *imapSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, op
 		rw.WriteUID(imap.UID(uid))
 
 		if options.Flags {
-			rw.WriteFlags(itemFlags(item))
+			rw.WriteFlags(itemFlags(item, snap.deleted[item.ServerID]))
 		}
 		if options.InternalDate {
 			rw.WriteInternalDate(item.DateReceived)
@@ -312,45 +313,100 @@ func (sess *imapSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, op
 	})
 }
 
-func (sess *imapSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, storeFlags *imap.StoreFlags, options *imap.StoreOptions) error {
-	if sess.snap == nil {
-		return fmt.Errorf("未选中文件夹")
-	}
+// flagMutation 记录一次 STORE 变更的邮件定位信息，供响应写回使用。
+type flagMutation struct {
+	seqNum   uint32
+	uid      uint32
+	serverID string
+}
+
+// applyFlagMutations 应用 STORE 的 \Seen/\Deleted 变更到本地 state，
+// 返回需要回推服务器的已读变更与写回定位。失败即中止，已应用的不回滚。
+func (sess *imapSession) applyFlagMutations(numSet imap.NumSet, storeFlags *imap.StoreFlags) ([]eas.EmailChange, []flagMutation, error) {
 	snap := sess.snap
 	st := sess.d.engine.st
-
-	return forEachItem(numSet, snap, func(seqNum uint32, item eas.EmailItem) error {
+	var readChanges []eas.EmailChange
+	var mutated []flagMutation
+	err := forEachItem(numSet, snap, func(seqNum uint32, item eas.EmailItem) error {
 		serverID := item.ServerID
-		uid := snap.uidForSID[serverID]
 		for _, f := range storeFlags.Flags {
-			if f == "\\Seen" {
+			switch f {
+			case "\\Seen":
 				switch storeFlags.Op {
 				case imap.StoreFlagsSet, imap.StoreFlagsAdd:
 					if err := st.markRead(sess.selected, serverID); err != nil {
 						return err
 					}
+					readChanges = append(readChanges, eas.EmailChange{ServerID: serverID, Read: boolPtr(true)})
 				case imap.StoreFlagsDel:
 					if err := st.markUnread(sess.selected, serverID); err != nil {
+						return err
+					}
+					readChanges = append(readChanges, eas.EmailChange{ServerID: serverID, Read: boolPtr(false)})
+				}
+			case "\\Deleted":
+				switch storeFlags.Op {
+				case imap.StoreFlagsSet, imap.StoreFlagsAdd:
+					if err := st.setDeleted(sess.selected, serverID, true); err != nil {
+						return err
+					}
+				case imap.StoreFlagsDel:
+					if err := st.setDeleted(sess.selected, serverID, false); err != nil {
 						return err
 					}
 				}
 			}
 		}
-		rw := w.CreateMessage(seqNum)
-		rw.WriteUID(imap.UID(uid))
-		// 读回最新 flags（markRead/Unread 已改内存）
+		mutated = append(mutated, flagMutation{seqNum: seqNum, uid: snap.uidForSID[serverID], serverID: serverID})
+		return nil
+	})
+	return readChanges, mutated, err
+}
+
+// pushReadChanges 批量回推已读状态到服务器。失败只记日志——本地状态已生效，
+// 若服务器随后以未读覆盖，下次增量同步会自然收敛。
+func (sess *imapSession) pushReadChanges(ctx context.Context, readChanges []eas.EmailChange) {
+	if len(readChanges) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if _, err := sess.d.engine.c.ApplyEmailChanges(ctx, sess.selected, readChanges); err != nil {
+		log.Printf("[imap] 已读状态回推失败（本地已生效）: %v", err)
+	}
+}
+
+func (sess *imapSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, storeFlags *imap.StoreFlags, options *imap.StoreOptions) error {
+	if sess.snap == nil {
+		return fmt.Errorf("未选中文件夹")
+	}
+	readChanges, mutated, err := sess.applyFlagMutations(numSet, storeFlags)
+	if err != nil {
+		return err
+	}
+
+	st := sess.d.engine.st
+	for _, m := range mutated {
+		rw := w.CreateMessage(m.seqNum)
+		rw.WriteUID(imap.UID(m.uid))
+		// 读回最新 flags（markRead/Unread/setDeleted 已改内存）
 		st.mu.Lock()
 		var flags []imap.Flag
 		for _, it := range st.Items[sess.selected] {
-			if it.ServerID == serverID {
-				flags = itemFlags(it)
+			if it.ServerID == m.serverID {
+				flags = itemFlags(it, st.Deleted[sess.selected][m.serverID])
 				break
 			}
 		}
 		st.mu.Unlock()
 		rw.WriteFlags(flags)
-		return rw.Close()
-	})
+		if err := rw.Close(); err != nil {
+			return err
+		}
+	}
+
+	sess.pushReadChanges(sess.ctx, readChanges)
+	return nil
 }
 
 func (sess *imapSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions) (*imap.SearchData, error) {
@@ -390,12 +446,191 @@ func (sess *imapSession) Search(numKind imapserver.NumKind, criteria *imap.Searc
 	return data, nil
 }
 
+// moveItemsStatusOK 是 MS-ASCMD MoveItems 的成功状态码（注意：不是 eas.StatusOK=1）。
+const moveItemsStatusOK = 3
+
+// expungeMarked 把已标记 \Deleted（且若给定在 uids 集合内）的邮件移到服务器垃圾箱，
+// 清理本地 state 与缓存，返回被移除邮件的 seqNum 列表供 EXPUNGE 响应。
+func (sess *imapSession) expungeMarked(uids *imap.UIDSet) ([]uint32, error) {
+	snap := sess.snap
+	engine := sess.d.engine
+
+	type victim struct {
+		serverID string
+		seq      uint32
+	}
+	var victims []victim
+	for i, it := range snap.items {
+		if !snap.deleted[it.ServerID] {
+			continue
+		}
+		uid := snap.uidForSID[it.ServerID]
+		if uids != nil && !uids.Contains(imap.UID(uid)) {
+			continue
+		}
+		victims = append(victims, victim{serverID: it.ServerID, seq: uint32(i + 1)})
+	}
+	if len(victims) == 0 {
+		return nil, nil
+	}
+
+	trashID, err := engine.trashFolderID()
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(victims))
+	for _, v := range victims {
+		ids = append(ids, v.serverID)
+	}
+	ctx, cancel := context.WithTimeout(sess.ctx, 60*time.Second)
+	defer cancel()
+	results, err := engine.c.MoveItems(ctx, sess.selected, trashID, ids)
+	if err != nil {
+		return nil, fmt.Errorf("服务器删除失败: %w", err)
+	}
+
+	// 按 SrcServerID 筛成功项（EAS 删除=移到已删除文件夹，可恢复）
+	dstIDOf := map[string]string{}
+	for _, r := range results {
+		if r.Status == moveItemsStatusOK {
+			dstIDOf[r.SrcServerID] = r.DstServerID
+		}
+	}
+	var moved []string
+	var seqs []uint32
+	var movedItems []eas.EmailItem
+	for _, v := range victims {
+		dstID, ok := dstIDOf[v.serverID]
+		if !ok {
+			continue
+		}
+		moved = append(moved, v.serverID)
+		seqs = append(seqs, v.seq)
+		if dstID == "" {
+			dstID = v.serverID // 服务器未分配新 ID 时沿用原 ID
+		}
+		it := snap.items[v.seq-1]
+		it.ServerID = dstID // 服务器在目标文件夹分配的新 ID（Coremail 会改）
+		movedItems = append(movedItems, it)
+	}
+	if len(moved) == 0 {
+		return nil, fmt.Errorf("服务器拒绝删除全部 %d 封邮件", len(ids))
+	}
+	if err := engine.st.removeItems(sess.selected, moved...); err != nil {
+		return nil, err
+	}
+	// EAS 不回显本设备引起的变更：目标文件夹的增量同步永远看不到移入的邮件，
+	// 必须自己落进本地 state，否则垃圾箱在 Mail 里永远缺这些邮件。
+	if err := engine.st.addMovedItems(trashID, movedItems); err != nil {
+		return nil, err
+	}
+	engine.invalidateMessageCache(sess.selected, moved...)
+	sess.refreshSnapshot()
+	sess.d.broadcast(sess.selected)
+	// 后台补一次双向同步，让垃圾箱尽快反映新邮件
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		_ = engine.syncMail(ctx, sess.selected)
+		_ = engine.syncMail(ctx, trashID)
+	}()
+	return seqs, nil
+}
+
 func (sess *imapSession) Expunge(w *imapserver.ExpungeWriter, uids *imap.UIDSet) error {
-	return errNotSupported("EXPUNGE")
+	if sess.snap == nil {
+		return fmt.Errorf("未选中文件夹")
+	}
+	seqs, err := sess.expungeMarked(uids)
+	if err != nil {
+		return err
+	}
+	for _, seq := range seqs {
+		if err := w.WriteExpunge(seq); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (sess *imapSession) Copy(numSet imap.NumSet, dest string) (*imap.CopyData, error) {
-	return nil, errNotSupported("COPY")
+	if sess.snap == nil {
+		return nil, fmt.Errorf("未选中文件夹")
+	}
+	snap := sess.snap
+	engine := sess.d.engine
+
+	dst, ok := engine.findFolder(dest)
+	if !ok {
+		return nil, fmt.Errorf("不存在的文件夹: %s", dest)
+	}
+	var ids []string
+	if err := forEachItem(numSet, snap, func(seqNum uint32, item eas.EmailItem) error {
+		ids = append(ids, item.ServerID)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	// EAS 无服务端复制语义，COPY 以 MoveItems 实现（与 DavMail 一致）：
+	// 邮件移入目标文件夹后不再留在原文件夹。
+	ctx, cancel := context.WithTimeout(sess.ctx, 60*time.Second)
+	defer cancel()
+	results, err := engine.c.MoveItems(ctx, sess.selected, dst.ServerID, ids)
+	if err != nil {
+		return nil, fmt.Errorf("服务器移动失败: %w", err)
+	}
+	dstIDOf := map[string]string{}
+	for _, r := range results {
+		if r.Status == moveItemsStatusOK {
+			dstIDOf[r.SrcServerID] = r.DstServerID
+		}
+	}
+	itemByID := map[string]eas.EmailItem{}
+	for _, it := range snap.items {
+		itemByID[it.ServerID] = it
+	}
+	var moved []string
+	var movedItems []eas.EmailItem
+	for _, id := range ids {
+		dstID, ok := dstIDOf[id]
+		if !ok {
+			continue
+		}
+		moved = append(moved, id)
+		if dstID == "" {
+			dstID = id
+		}
+		it := itemByID[id]
+		it.ServerID = dstID
+		movedItems = append(movedItems, it)
+	}
+	if len(moved) > 0 {
+		if err := engine.st.removeItems(sess.selected, moved...); err != nil {
+			return nil, err
+		}
+		// EAS 不回显本设备引起的变更：目标文件夹靠自己落库才能看到移入的邮件。
+		if err := engine.st.addMovedItems(dst.ServerID, movedItems); err != nil {
+			return nil, err
+		}
+		engine.invalidateMessageCache(sess.selected, moved...)
+		sess.refreshSnapshot()
+		sess.d.broadcast(sess.selected)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			_ = engine.syncMail(ctx, sess.selected)
+			_ = engine.syncMail(ctx, dst.ServerID)
+		}()
+	}
+	if len(moved) < len(ids) {
+		return nil, fmt.Errorf("部分邮件移动失败（%d/%d 成功）", len(moved), len(ids))
+	}
+	// 未广告 UIDPLUS，不返回目标 UID 映射，客户端会自行重新同步
+	return nil, nil
 }
 
 func (sess *imapSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error {
@@ -427,7 +662,16 @@ func (sess *imapSession) refreshSnapshot() {
 		uidForSID[e.ServerID] = e.UID
 		sidForUID[e.UID] = e.ServerID
 	}
-	sess.snap = &mboxSnapshot{items: items, uidForSID: uidForSID, sidForUID: sidForUID, uidValidity: fm.UIDValidity}
+	sess.snap = &mboxSnapshot{items: items, uidForSID: uidForSID, sidForUID: sidForUID, uidValidity: fm.UIDValidity, deleted: snapshotDeleted(st, sess.selected)}
+}
+
+// snapshotDeleted 提取文件夹的 \Deleted 标记快照。调用方需持有 st.mu。
+func snapshotDeleted(st *diskState, folderID string) map[string]bool {
+	out := map[string]bool{}
+	for id := range st.Deleted[folderID] {
+		out[id] = true
+	}
+	return out
 }
 
 func (sess *imapSession) Idle(w *imapserver.UpdateWriter, stop <-chan struct{}) error {
@@ -509,12 +753,18 @@ func parseEASAddrs(raw string) []imap.Address {
 	return out
 }
 
-func itemFlags(item eas.EmailItem) []imap.Flag {
+func itemFlags(item eas.EmailItem, deleted bool) []imap.Flag {
+	var flags []imap.Flag
 	if item.Read {
-		return []imap.Flag{"\\Seen"}
+		flags = append(flags, "\\Seen")
 	}
-	return nil
+	if deleted {
+		flags = append(flags, "\\Deleted")
+	}
+	return flags
 }
+
+func boolPtr(v bool) *bool { return &v }
 
 // forEachItem 按 NumSet 遍历快照中的消息，调用 fn(seqNum, item)。
 func forEachItem(numSet imap.NumSet, snap *mboxSnapshot, fn func(uint32, eas.EmailItem) error) error {

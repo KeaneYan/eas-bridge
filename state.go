@@ -38,6 +38,7 @@ type diskState struct {
 	UIDs         map[string][]uidEntry      `json:"uids"`        // folderID → UID 映射（按 UID 升序）
 	FolderMeta   map[string]folderMeta      `json:"folder_meta"` // folderID → UID 管理元数据
 	Events       map[string]eas.EventItem   `json:"events"`      // 日历事件缓存 serverID→event
+	Deleted      map[string]map[string]bool `json:"deleted,omitempty"` // folderID → serverID → 已标记 \Deleted
 }
 
 func loadState(path string) (*diskState, error) {
@@ -48,6 +49,7 @@ func loadState(path string) (*diskState, error) {
 		UIDs:       map[string][]uidEntry{},
 		FolderMeta: map[string]folderMeta{},
 		Events:     map[string]eas.EventItem{},
+		Deleted:    map[string]map[string]bool{},
 	}
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -74,6 +76,9 @@ func loadState(path string) (*diskState, error) {
 	}
 	if s.Events == nil {
 		s.Events = map[string]eas.EventItem{}
+	}
+	if s.Deleted == nil {
+		s.Deleted = map[string]map[string]bool{}
 	}
 	return s, nil
 }
@@ -260,5 +265,63 @@ func (s *diskState) markUnread(folderID, serverID string) error {
 			break
 		}
 	}
+	return s.saveLocked()
+}
+
+// setDeleted 标记/清除某封邮件的 \Deleted 旗标（本地标记，EXPUNGE 时才真正删除）。
+func (s *diskState) setDeleted(folderID, serverID string, deleted bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m := s.Deleted[folderID]
+	if m == nil {
+		m = map[string]bool{}
+		s.Deleted[folderID] = m
+	}
+	if deleted {
+		m[serverID] = true
+	} else {
+		delete(m, serverID)
+	}
+	return s.saveLocked()
+}
+
+// isDeleted 查询邮件是否被标记 \Deleted。调用方需已持有锁或使用本方法的锁。
+func (s *diskState) isDeleted(folderID, serverID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Deleted[folderID][serverID]
+}
+
+// removeItems 从文件夹移除邮件并清理 \Deleted 标记（EXPUNGE/COPY 移出后调用）。
+func (s *diskState) removeItems(folderID string, serverIDs ...string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	drop := map[string]bool{}
+	for _, id := range serverIDs {
+		drop[id] = true
+	}
+	var kept []eas.EmailItem
+	for _, it := range s.Items[folderID] {
+		if !drop[it.ServerID] {
+			kept = append(kept, it)
+		}
+	}
+	s.Items[folderID] = kept
+	if m := s.Deleted[folderID]; m != nil {
+		for _, id := range serverIDs {
+			delete(m, id)
+		}
+	}
+	return s.saveLocked()
+}
+
+// addMovedItems 把 MoveItems 移入的邮件追加到目标文件夹并分配 UID。
+// EAS 不回显本设备引起的变更（fork AGENTS.md 与实测均确认），目标文件夹的
+// 增量同步永远看不到这些邮件，必须由客户端自己落进本地 state。
+func (s *diskState) addMovedItems(dstFolder string, items []eas.EmailItem) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Items[dstFolder] = append(s.Items[dstFolder], items...)
+	s.assignUIDs(dstFolder, items)
 	return s.saveLocked()
 }
