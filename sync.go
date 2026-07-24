@@ -272,13 +272,13 @@ func (e *syncEngine) syncCalendarOnce(ctx context.Context) error {
 }
 
 // mailFolderIDs 返回当前所有可同步邮件文件夹的 ServerID（每轮重新读，新文件夹自动纳入）。
-// 基于 isMailFolderType（folders.go），额外排除发件箱：其内容是发送瞬态，SyncEmail 无意义。
+// 基于 isMailFolderType（folders.go）。
 func (e *syncEngine) mailFolderIDs() []string {
 	e.st.mu.Lock()
 	defer e.st.mu.Unlock()
 	var ids []string
 	for _, f := range e.st.Folders {
-		if isMailFolderType(f.Type) && f.Type != eas.FolderTypeOutbox {
+		if isMailFolderType(f.Type) {
 			ids = append(ids, f.ServerID)
 		}
 	}

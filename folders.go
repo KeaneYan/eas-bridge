@@ -14,7 +14,6 @@ func isMailFolderType(folderType eas.FolderType) bool {
 		eas.FolderTypeDrafts,
 		eas.FolderTypeDeletedItems,
 		eas.FolderTypeSentItems,
-		eas.FolderTypeOutbox,
 		eas.FolderTypeUserMail:
 		return true
 	default:
