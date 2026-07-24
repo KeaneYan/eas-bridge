@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -42,7 +43,7 @@ func (b *caldavBackend) PutCalendarObject(ctx context.Context, path string, cale
 		// 否则 path 形如服务器分配的 ID（Coremail sid 含冒号，如 Event:DEFAULT:1）
 		// 但本地没有——多半是 state 缺失/事件在同步窗口外，此时当创建会在服务器
 		// 产生重复事件（ZCode B1）。拒绝并要求客户端刷新。
-		clientAssertsCreate := opts != nil && opts.IfNoneMatch.IsSet()
+		clientAssertsCreate := opts != nil && opts.IfNoneMatch.IsWildcard()
 		if !clientAssertsCreate && strings.Contains(serverID, ":") {
 			return nil, webdavErr(http.StatusPreconditionFailed,
 				"事件不在本地缓存，为避免服务器产生重复事件已拒绝写入；请刷新日历后重试")
@@ -115,11 +116,13 @@ func (b *caldavBackend) DeleteCalendarObject(ctx context.Context, path string) e
 
 // calWriteErr 把日历写失败翻译为 CalDAV 错误。Coremail 对日历文件夹的上行
 // Sync 命令一律回 Status 5（实测 Add/Change 跨 12.1/14.0/14.1 均拒绝，
-// 邮件上行正常）——映射为 403 并给出明确原因，而不是笼统的 500。
+// 邮件上行正常）——映射为 403 并给出原因，而不是笼统的 500。
+// 同时记日志：若未来服务器策略放开，Status 5 可能代表真实故障，日志可区分。
 func calWriteErr(op string, err error) error {
 	if eas.IsStatusCode(err, 5) {
+		log.Printf("[caldav] %s被服务器拒绝 (Sync Status 5): %v", op, err)
 		return webdavErr(http.StatusForbidden,
-			op+"：服务器拒绝日历写入（Coremail 策略——日历经 EAS 只读，请在网页端/会议系统操作）")
+			op+"：服务器拒绝日历写入（Sync Status 5；实测 Coremail 日历经 EAS 只读，请在网页端/会议系统操作）")
 	}
 	return fmt.Errorf("服务器%s失败: %w", op, err)
 }
