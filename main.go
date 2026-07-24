@@ -42,17 +42,7 @@ func main() {
 	if err := engine.syncFolders(ctx); err != nil {
 		log.Fatal("同步文件夹失败: ", err)
 	}
-	engine.st.mu.Lock()
-	folders := append([]string(nil), func() []string {
-		var ids []string
-		for _, f := range engine.st.Folders {
-			if isMailFolderType(f.Type) {
-				ids = append(ids, f.ServerID)
-			}
-		}
-		return ids
-	}()...)
-	engine.st.mu.Unlock()
+	folders := engine.mailFolderIDs()
 
 	// 启动 IMAP 服务
 	imapd := newIMAPD(engine)
