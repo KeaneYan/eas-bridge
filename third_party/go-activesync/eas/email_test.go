@@ -137,6 +137,9 @@ func TestParseEmailItem_flagAndImportance(t *testing.T) {
 	if got.FlagStatus != 2 {
 		t.Errorf("FlagStatus = %d", got.FlagStatus)
 	}
+	if !got.FlagStatusPresent {
+		t.Error("FlagStatusPresent = false")
+	}
 	if !got.Flagged() {
 		t.Errorf("Flagged() = false")
 	}
@@ -219,7 +222,7 @@ func TestParseEmailItem_allEmailFields(t *testing.T) {
 		got.Cc != "carol@x" || got.ReplyTo != "alice@reply" || got.DisplayTo != "Bob" {
 		t.Errorf("address fields = %+v", got)
 	}
-	if !got.Read || got.Importance != 2 || got.ThreadTopic != "Thread" ||
+	if !got.Read || !got.ReadPresent || got.Importance != 2 || got.ThreadTopic != "Thread" ||
 		got.MessageClass != "IPM.Note" || got.FlagStatus != 2 || !got.Flagged() {
 		t.Errorf("scalar fields = %+v", got)
 	}

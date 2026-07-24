@@ -1,15 +1,14 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"time"
 
@@ -22,9 +21,10 @@ const (
 
 // syncEngine 封装 EAS 客户端与同步状态。
 type syncEngine struct {
-	cfg *config
-	st  *diskState
-	c   eas.Client
+	cfg     *config
+	st      *diskState
+	c       eas.Client
+	flights flightGroup
 }
 
 func newSyncEngine(cfg *config) (*syncEngine, error) {
@@ -73,16 +73,15 @@ func newSyncEngine(cfg *config) (*syncEngine, error) {
 	if err := c.Provision(context.Background()); err != nil {
 		return nil, fmt.Errorf("Provision: %w", err)
 	}
-	return &syncEngine{cfg: cfg, st: st, c: c}, nil
+	engine := &syncEngine{cfg: cfg, st: st, c: c}
+	engine.scheduleCachePrune()
+	return engine, nil
 }
 
 func (e *syncEngine) syncFolders(ctx context.Context) error {
 	res, err := e.c.FolderSync(ctx)
 	if err != nil {
 		return err
-	}
-	if len(res.Added) == 0 && len(res.Updated) == 0 && len(res.Deleted) == 0 {
-		return nil
 	}
 	return e.st.mutate(func() {
 		byID := map[string]eas.Folder{}
@@ -102,10 +101,20 @@ func (e *syncEngine) syncFolders(ctx context.Context) error {
 		for _, f := range byID {
 			e.st.Folders = append(e.st.Folders, f)
 		}
+		sort.Slice(e.st.Folders, func(i, j int) bool {
+			return e.st.Folders[i].ServerID < e.st.Folders[j].ServerID
+		})
 	})
 }
 
 func (e *syncEngine) syncMail(ctx context.Context, folderID string) error {
+	_, err := e.flights.DoContext(ctx, "sync-mail:"+folderID, func() (any, error) {
+		return nil, e.syncMailOnce(ctx, folderID)
+	})
+	return err
+}
+
+func (e *syncEngine) syncMailOnce(ctx context.Context, folderID string) error {
 	res, err := e.c.SyncEmail(ctx, folderID, eas.EmailSyncOptions{
 		WindowSize: 200,
 		BodyType:   eas.BodyTypePlain,
@@ -113,33 +122,83 @@ func (e *syncEngine) syncMail(ctx context.Context, folderID string) error {
 	if err != nil {
 		return err
 	}
-	if len(res.Added) == 0 && len(res.Changed) == 0 && len(res.Deleted) == 0 {
-		return nil
-	}
-	return e.st.mutate(func() {
+	invalidated := make([]string, 0, len(res.Added)+len(res.Changed)+len(res.Deleted))
+	err = e.st.mutate(func() {
 		existing := map[string]eas.EmailItem{}
+		order := make([]string, 0, len(e.st.Items[folderID])+len(res.Added))
 		for _, it := range e.st.Items[folderID] {
 			existing[it.ServerID] = it
+			order = append(order, it.ServerID)
 		}
 		for _, it := range res.Added {
+			if _, exists := existing[it.ServerID]; !exists {
+				order = append(order, it.ServerID)
+			}
 			existing[it.ServerID] = it
+			invalidated = append(invalidated, it.ServerID)
 		}
 		for _, it := range res.Changed {
-			existing[it.ServerID] = it
+			before := existing[it.ServerID]
+			if _, exists := existing[it.ServerID]; !exists {
+				order = append(order, it.ServerID)
+			}
+			after := mergeEmailChange(before, it)
+			existing[it.ServerID] = after
+			if !emailMIMEContentEqual(before, after) {
+				invalidated = append(invalidated, it.ServerID)
+			}
 		}
 		deletedIDs := map[string]bool{}
 		for _, id := range res.Deleted {
 			deletedIDs[id] = true
+			invalidated = append(invalidated, id)
 		}
 		var merged []eas.EmailItem
-		for _, it := range existing {
-			if !deletedIDs[it.ServerID] {
-				merged = append(merged, it)
+		for _, id := range order {
+			if !deletedIDs[id] {
+				merged = append(merged, existing[id])
 			}
 		}
 		merged = e.st.assignUIDs(folderID, merged)
 		e.st.Items[folderID] = merged
 	})
+	if err != nil {
+		return err
+	}
+	e.invalidateMessageCache(folderID, invalidated...)
+	return nil
+}
+
+// mergeEmailChange 保留 EAS Change 未携带的邮件字段。
+// 大多数服务器的 Change 是稀疏增量（常见只有 Read/Flag），直接替换会丢失主题、
+// 发件人、正文摘要和附件元数据。
+func mergeEmailChange(base, change eas.EmailItem) eas.EmailItem {
+	if base.ServerID == "" {
+		return change
+	}
+	merged := mergeEmailItem(base, change)
+	if change.ReadPresent {
+		merged.Read = change.Read
+	}
+	if change.FlagStatusPresent {
+		merged.FlagStatus = change.FlagStatus
+	}
+	return merged
+}
+
+func emailMIMEContentEqual(a, b eas.EmailItem) bool {
+	return a.ServerID == b.ServerID &&
+		a.Subject == b.Subject &&
+		a.From == b.From &&
+		a.To == b.To &&
+		a.Cc == b.Cc &&
+		a.ReplyTo == b.ReplyTo &&
+		a.DateReceived.Equal(b.DateReceived) &&
+		a.BodyType == b.BodyType &&
+		a.Body == b.Body &&
+		a.BodyTruncated == b.BodyTruncated &&
+		a.HasAttachments == b.HasAttachments &&
+		reflect.DeepEqual(a.Attachments, b.Attachments)
 }
 
 func (e *syncEngine) findFolder(folderID string) (eas.Folder, bool) {
@@ -150,102 +209,25 @@ func (e *syncEngine) findFolder(folderID string) (eas.Folder, bool) {
 			return f, true
 		}
 	}
-	aliases := map[string]eas.FolderType{
-		"INBOX": eas.FolderTypeInbox, "收件箱": eas.FolderTypeInbox,
-		"Sent": eas.FolderTypeSentItems, "已发送": eas.FolderTypeSentItems,
-		"Drafts": eas.FolderTypeDrafts, "草稿": eas.FolderTypeDrafts,
-		"Trash": eas.FolderTypeDeletedItems, "已删除": eas.FolderTypeDeletedItems,
-	}
-	if t, ok := aliases[folderID]; ok {
-		for _, f := range e.st.Folders {
-			if f.Type == t {
-				return f, true
-			}
+	names := imapFolderNames(e.st.Folders)
+	for _, f := range e.st.Folders {
+		if strings.EqualFold(names[f.ServerID], folderID) {
+			return f, true
 		}
 	}
 	return eas.Folder{}, false
 }
 
-// fetchMIME 从缓存或服务器拉取完整 RFC822 消息。
-// Coremail EAS 对纯文本邮件不返回 BodyMIME（已知怪癖），此时用 EAS 元数据构造。
-func (e *syncEngine) fetchMIME(ctx context.Context, folderID, serverID string) ([]byte, error) {
-	dir, err := ensureMIMECacheDir(folderID)
-	if err != nil {
-		return nil, err
-	}
-	cachePath := filepath.Join(dir, serverID+".eml")
-	if b, err := os.ReadFile(cachePath); err == nil && len(b) > 10 {
-		return b, nil
-	}
-
-	// 尝试从服务器拉 MIME
-	f, ok := e.findFolder(folderID)
-	if ok {
-		if it, ferr := e.c.FetchEmail(ctx, f.ServerID, serverID, eas.FetchEmailOptions{BodyType: eas.BodyTypeMIME}); ferr == nil && len(it.BodyMIME) > 10 {
-			_ = os.WriteFile(cachePath, it.BodyMIME, 0600)
-			return it.BodyMIME, nil
-		}
-	}
-
-	// 降级：从 EAS 元数据构造 RFC822 消息
-	e.st.mu.Lock()
-	var item eas.EmailItem
-	for _, it := range e.st.Items[folderID] {
-		if it.ServerID == serverID {
-			item = it
-			break
-		}
-	}
-	e.st.mu.Unlock()
-	b := constructRFC822(item)
-	if len(b) > 0 {
-		_ = os.WriteFile(cachePath, b, 0600)
-	}
-	return b, nil
-}
-
-// constructRFC822 从 EAS 元数据构造最小合法 RFC822 消息。
-// H3 修复：所有 header 值先剥 CR/LF，防 header 注入。
-func constructRFC822(item eas.EmailItem) []byte {
-	sanitize := func(v string) string {
-		return strings.NewReplacer("\r", " ", "\n", " ").Replace(v)
-	}
-	var buf bytes.Buffer
-	writeHeader := func(k, v string) {
-		if v != "" {
-			fmt.Fprintf(&buf, "%s: %s\r\n", k, sanitize(v))
-		}
-	}
-	writeHeader("From", item.From)
-	writeHeader("To", item.To)
-	writeHeader("Cc", item.Cc)
-	writeHeader("Subject", item.Subject)
-	if !item.DateReceived.IsZero() {
-		fmt.Fprintf(&buf, "Date: %s\r\n", item.DateReceived.Format("Mon, 02 Jan 2006 15:04:05 -0700"))
-	}
-	buf.WriteString("MIME-Version: 1.0\r\n")
-	buf.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
-	buf.WriteString("Content-Transfer-Encoding: base64\r\n")
-	buf.WriteString("\r\n")
-	body := item.Body
-	if body == "" {
-		body = "(no body)"
-	}
-	encoded := base64.StdEncoding.EncodeToString([]byte(body))
-	for i := 0; i < len(encoded); i += 76 {
-		end := i + 76
-		if end > len(encoded) {
-			end = len(encoded)
-		}
-		buf.WriteString(encoded[i:end])
-		buf.WriteString("\r\n")
-	}
-	return buf.Bytes()
-}
-
 // syncCalendar 增量同步日历事件到 st.Events（synckey 由库自动持久化）。
 // Coremail 忽略 FilterType，首次全量拉取后靠 synckey 增量。
 func (e *syncEngine) syncCalendar(ctx context.Context) error {
+	_, err := e.flights.DoContext(ctx, "sync-calendar", func() (any, error) {
+		return nil, e.syncCalendarOnce(ctx)
+	})
+	return err
+}
+
+func (e *syncEngine) syncCalendarOnce(ctx context.Context) error {
 	e.st.mu.Lock()
 	var calFolderID string
 	for _, f := range e.st.Folders {
@@ -263,18 +245,24 @@ func (e *syncEngine) syncCalendar(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("SyncCalendar: %w", err)
 		}
-		if err := e.st.mutate(func() {
-			for _, ev := range res.Added {
-				e.st.Events[ev.ServerID] = ev
-			}
-			for _, ev := range res.Changed {
-				e.st.Events[ev.ServerID] = ev
-			}
-			for _, id := range res.Deleted {
-				delete(e.st.Events, id)
-			}
-		}); err != nil {
-			return err
+		e.st.mu.Lock()
+		for _, ev := range res.Added {
+			e.st.Events[ev.ServerID] = ev
+		}
+		for _, ev := range res.Changed {
+			e.st.Events[ev.ServerID] = ev
+		}
+		for _, id := range res.Deleted {
+			delete(e.st.Events, id)
+		}
+		shouldSave := (page+1)%10 == 0 || !res.MoreAvailable || page == 99
+		var saveErr error
+		if shouldSave {
+			saveErr = e.st.saveLocked()
+		}
+		e.st.mu.Unlock()
+		if saveErr != nil {
+			return saveErr
 		}
 		if !res.MoreAvailable {
 			return nil

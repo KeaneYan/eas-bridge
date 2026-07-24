@@ -220,7 +220,7 @@ func TestSyncEmail_changeAndDelete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Changed) != 1 || !res.Changed[0].Read || res.Changed[0].ServerID != "inbox:1" {
+	if len(res.Changed) != 1 || !res.Changed[0].Read || !res.Changed[0].ReadPresent || res.Changed[0].ServerID != "inbox:1" {
 		t.Errorf("Changed = %+v", res.Changed)
 	}
 	if len(res.Deleted) != 1 || res.Deleted[0] != "inbox:gone" {
