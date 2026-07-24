@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hstern/go-activesync/eas"
@@ -25,6 +26,81 @@ type syncEngine struct {
 	st      *diskState
 	c       eas.Client
 	flights flightGroup
+
+	backoffMu sync.Mutex
+	backoff   map[string]folderBackoff
+}
+
+// folderBackoff 记录单个同步通道（邮件文件夹/日历）的连续 Status 5 退避状态。
+type folderBackoff struct {
+	failures    int
+	nextRetry   time.Time
+	lastSkipLog time.Time
+}
+
+// syncBackoffSteps 连续第 N 次 Status 5 后的退避时长（超出最后一档按封顶值）。
+// 背景：2026-07-25 凌晨 mm.tenbank.com 故障 6 小时，全文件夹 Status 5，
+// 桥每分钟对每个文件夹"清 key + 全量重拉 6 个月邮件"，既打服务器又反复
+// 摧毁本地同步状态。退避把故障期的重拉频率压到最多 2 次/小时/文件夹。
+var syncBackoffSteps = []time.Duration{
+	1 * time.Minute,
+	5 * time.Minute,
+	15 * time.Minute,
+	30 * time.Minute,
+}
+
+// backoffRemaining 返回 key 当前剩余的退避时间（0 表示可以同步）。
+func (e *syncEngine) backoffRemaining(key string) time.Duration {
+	e.backoffMu.Lock()
+	defer e.backoffMu.Unlock()
+	b, ok := e.backoff[key]
+	if !ok {
+		return 0
+	}
+	if d := time.Until(b.nextRetry); d > 0 {
+		return d
+	}
+	return 0
+}
+
+// skipBackoff 报告 key 是否处于退避期；处于时按 10 分钟/通道的频率上限打一条
+// 跳过日志（退避期不能全静默——30m 封顶档下故障几小时也该在日志里看得见）。
+func (e *syncEngine) skipBackoff(key string) bool {
+	d := e.backoffRemaining(key)
+	if d <= 0 {
+		return false
+	}
+	e.backoffMu.Lock()
+	if b, ok := e.backoff[key]; ok && time.Since(b.lastSkipLog) >= 10*time.Minute {
+		b.lastSkipLog = time.Now()
+		e.backoff[key] = b
+		log.Printf("[sync] %s 处于 Status 5 退避期（剩余 ~%s），本轮跳过，本地数据照常服务", key, d.Round(time.Second))
+	}
+	e.backoffMu.Unlock()
+	return true
+}
+
+// trackSyncResult 按同步结果更新退避状态：成功清零；Status 5 升档；
+// 其他错误（网络抖动等）不影响退避（它们不触发清 key 全量重拉，危害不同）。
+func (e *syncEngine) trackSyncResult(key string, err error) {
+	e.backoffMu.Lock()
+	defer e.backoffMu.Unlock()
+	if err == nil {
+		delete(e.backoff, key)
+		return
+	}
+	if !eas.IsStatusCode(err, 5) {
+		return
+	}
+	b := e.backoff[key]
+	b.failures++
+	step := syncBackoffSteps[min(b.failures, len(syncBackoffSteps))-1]
+	b.nextRetry = time.Now().Add(step)
+	if e.backoff == nil {
+		e.backoff = map[string]folderBackoff{}
+	}
+	e.backoff[key] = b
+	log.Printf("[sync] %s 连续第 %d 次 Status 5，退避 %s 后重试", key, b.failures, step)
 }
 
 func newSyncEngine(cfg *config) (*syncEngine, error) {
@@ -73,7 +149,7 @@ func newSyncEngine(cfg *config) (*syncEngine, error) {
 	if err := c.Provision(context.Background()); err != nil {
 		return nil, fmt.Errorf("Provision: %w", err)
 	}
-	engine := &syncEngine{cfg: cfg, st: st, c: c}
+	engine := &syncEngine{cfg: cfg, st: st, c: c, backoff: map[string]folderBackoff{}}
 	engine.scheduleCachePrune()
 	return engine, nil
 }
@@ -111,8 +187,15 @@ func (e *syncEngine) syncFolders(ctx context.Context) error {
 }
 
 func (e *syncEngine) syncMail(ctx context.Context, folderID string) error {
+	key := "mail:" + folderID
+	if e.skipBackoff(key) {
+		return nil // 退避期：本轮跳过，本地 state 照常服务 IMAP 读
+	}
 	_, err := e.flights.DoContext(ctx, "sync-mail:"+folderID, func() (any, error) {
-		return nil, e.syncMailOnce(ctx, folderID)
+		// trackSyncResult 放 flight 内：并发调用合并为一次执行，失败只计一次
+		err := e.syncMailOnce(ctx, folderID)
+		e.trackSyncResult(key, err)
+		return nil, err
 	})
 	return err
 }
@@ -283,8 +366,14 @@ func (e *syncEngine) findFolder(folderID string) (eas.Folder, bool) {
 // syncCalendar 增量同步日历事件到 st.Events（synckey 由库自动持久化）。
 // Coremail 忽略 FilterType，首次全量拉取后靠 synckey 增量。
 func (e *syncEngine) syncCalendar(ctx context.Context) error {
+	const key = "calendar"
+	if e.skipBackoff(key) {
+		return nil // 退避期：本轮跳过，本地事件缓存照常服务 CalDAV 读
+	}
 	_, err := e.flights.DoContext(ctx, "sync-calendar", func() (any, error) {
-		return nil, e.syncCalendarOnce(ctx)
+		err := e.syncCalendarOnce(ctx)
+		e.trackSyncResult(key, err)
+		return nil, err
 	})
 	return err
 }
@@ -380,6 +469,9 @@ func (e *syncEngine) poller(ctx context.Context, interval time.Duration, onChang
 			return
 		case <-ticker.C:
 			for _, fid := range e.mailFolderIDs() {
+				if e.skipBackoff("mail:" + fid) {
+					continue // 退避期跳过：不同步也不广播（本地无新数据可通知）
+				}
 				if err := e.syncMail(ctx, fid); err != nil {
 					// 单文件夹失败不影响其他文件夹；临时网络错误静默，持续错误记日志但不崩溃
 					if !errors.Is(err, context.Canceled) {
