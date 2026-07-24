@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"log"
 	"mime"
 	"mime/quotedprintable"
@@ -19,17 +20,23 @@ import (
 	"github.com/hstern/go-activesync/eas"
 )
 
-const mimeCacheVersion = "v2"
-
 type messageContentClient interface {
 	FetchEmail(ctx context.Context, folderID, serverID string, opts eas.FetchEmailOptions) (*eas.EmailItem, error)
 	FetchAttachment(ctx context.Context, fileReference string, rangeStart, rangeEnd int64) (*eas.FetchAttachmentResult, error)
+}
+
+type messageSource struct {
+	Item      eas.EmailItem
+	PlainBody string
+	RawMIME   []byte
+	Complete  bool
 }
 
 type mailAttachment struct {
 	meta        eas.Attachment
 	data        []byte
 	contentType string
+	index       int
 }
 
 type mimeEntity struct {
@@ -39,19 +46,21 @@ type mimeEntity struct {
 	contentID        string
 	contentLocation  string
 	body             []byte
+	attachment       *mailAttachment
 	boundary         string
 	children         []mimeEntity
 }
 
-func mimeCacheFilename(serverID string) string {
-	sum := sha256.Sum256([]byte(mimeCacheVersion + "\x00" + serverID))
-	return hex.EncodeToString(sum[:]) + ".eml"
+type mimeRenderOptions struct {
+	actualAttachments map[int]bool
+	estimatedPayloads bool
+	resolveAttachment func(index int) ([]byte, error)
 }
 
-func fetchAndBuildMIME(ctx context.Context, c messageContentClient, folderID, serverID string, summary eas.EmailItem) ([]byte, bool) {
+func fetchMessageSource(ctx context.Context, c messageContentClient, folderID, serverID string, summary eas.EmailItem) (messageSource, error) {
 	raw, rawErr := c.FetchEmail(ctx, folderID, serverID, eas.FetchEmailOptions{BodyType: eas.BodyTypeMIME})
 	if rawErr == nil && raw != nil && validRFC822(raw.BodyMIME) {
-		return raw.BodyMIME, true
+		return messageSource{Item: mergeEmailItem(summary, *raw), RawMIME: raw.BodyMIME, Complete: true}, nil
 	}
 	if rawErr != nil {
 		log.Printf("[mime] 原始 MIME 不可用，改用 HTML 重建: %v", rawErr)
@@ -59,47 +68,75 @@ func fetchAndBuildMIME(ctx context.Context, c messageContentClient, folderID, se
 
 	item := summary
 	full, htmlErr := c.FetchEmail(ctx, folderID, serverID, eas.FetchEmailOptions{BodyType: eas.BodyTypeHTML})
-	if htmlErr == nil && full != nil {
+	htmlFetched := htmlErr == nil && full != nil
+	if htmlFetched {
 		item = mergeEmailItem(item, *full)
 	} else if htmlErr != nil {
 		log.Printf("[mime] HTML 正文拉取失败，使用同步缓存: %v", htmlErr)
 	}
 
-	if item.Body == "" || item.BodyTruncated {
+	var plainBody string
+	if item.BodyType == eas.BodyTypeHTML || item.Body == "" || item.BodyTruncated {
 		plain, plainErr := c.FetchEmail(ctx, folderID, serverID, eas.FetchEmailOptions{BodyType: eas.BodyTypePlain})
 		if plainErr == nil && plain != nil {
-			item = mergeEmailItem(item, *plain)
+			if plain.BodyType == eas.BodyTypePlain && plain.Body != "" {
+				plainBody = plain.Body
+			}
+			item = mergeEmailMetadata(item, *plain)
+			if item.Body == "" && plain.Body != "" {
+				item.Body = plain.Body
+				item.BodyType = eas.BodyTypePlain
+				item.BodyTruncated = plain.BodyTruncated
+			}
 		} else if plainErr != nil {
 			log.Printf("[mime] 完整纯文本正文拉取失败，使用同步缓存: %v", plainErr)
 		}
 	}
+	bodyComplete := (htmlFetched && !full.BodyTruncated) || (summary.Body != "" && !summary.BodyTruncated)
+	attachmentMetadataComplete := !item.HasAttachments || len(item.Attachments) > 0
+	return messageSource{
+		Item:      item,
+		PlainBody: plainBody,
+		Complete:  bodyComplete && attachmentMetadataComplete,
+	}, nil
+}
 
-	attachments := make([]mailAttachment, 0, len(item.Attachments))
-	complete := true
-	for i, meta := range item.Attachments {
+func fetchAndBuildMIME(ctx context.Context, c messageContentClient, folderID, serverID string, summary eas.EmailItem) ([]byte, bool) {
+	source, err := fetchMessageSource(ctx, c, folderID, serverID, summary)
+	if err != nil {
+		return nil, false
+	}
+	if len(source.RawMIME) > 0 {
+		return source.RawMIME, true
+	}
+
+	attachments := make([]mailAttachment, 0, len(source.Item.Attachments))
+	complete := source.Complete
+	for i, meta := range source.Item.Attachments {
 		if meta.FileReference == "" {
 			complete = false
 			log.Printf("[mime] 第 %d 个附件缺少 FileReference，已跳过", i+1)
 			continue
 		}
-		got, err := c.FetchAttachment(ctx, meta.FileReference, 0, 0)
-		if err != nil {
+		got, fetchErr := c.FetchAttachment(ctx, meta.FileReference, 0, 0)
+		if fetchErr != nil {
 			complete = false
-			log.Printf("[mime] 第 %d 个附件下载失败，将在下次读取时重试: %v", i+1, err)
+			log.Printf("[mime] 第 %d 个附件下载失败，将在下次读取时重试: %v", i+1, fetchErr)
 			continue
 		}
 		attachments = append(attachments, mailAttachment{
 			meta:        meta,
 			data:        got.Data,
 			contentType: firstNonEmpty(meta.ContentType, got.ContentType),
+			index:       i,
 		})
 	}
-	if item.HasAttachments && len(item.Attachments) == 0 {
+	if source.Item.HasAttachments && len(source.Item.Attachments) == 0 {
 		complete = false
 		log.Printf("[mime] 邮件声明有附件但服务器未返回附件元数据，将在下次读取时重试")
 	}
 
-	return constructRFC822WithAttachments(item, serverID, attachments), complete
+	return constructRFC822Message(source.Item, source.PlainBody, serverID, attachments), complete
 }
 
 func validRFC822(raw []byte) bool {
@@ -111,6 +148,21 @@ func validRFC822(raw []byte) bool {
 }
 
 func mergeEmailItem(base, fetched eas.EmailItem) eas.EmailItem {
+	out := mergeEmailMetadata(base, fetched)
+	if fetched.Body != "" {
+		out.Body = fetched.Body
+		if fetched.BodyType != eas.BodyTypeNone {
+			out.BodyType = fetched.BodyType
+		}
+		out.BodyTruncated = fetched.BodyTruncated
+	}
+	if len(fetched.BodyMIME) > 0 {
+		out.BodyMIME = fetched.BodyMIME
+	}
+	return out
+}
+
+func mergeEmailMetadata(base, fetched eas.EmailItem) eas.EmailItem {
 	out := base
 	if fetched.ServerID != "" {
 		out.ServerID = fetched.ServerID
@@ -124,64 +176,109 @@ func mergeEmailItem(base, fetched eas.EmailItem) eas.EmailItem {
 	if fetched.To != "" {
 		out.To = fetched.To
 	}
+	if fetched.DisplayTo != "" {
+		out.DisplayTo = fetched.DisplayTo
+	}
 	if fetched.Cc != "" {
 		out.Cc = fetched.Cc
+	}
+	if fetched.Bcc != "" {
+		out.Bcc = fetched.Bcc
 	}
 	if fetched.ReplyTo != "" {
 		out.ReplyTo = fetched.ReplyTo
 	}
+	if fetched.Sender != "" {
+		out.Sender = fetched.Sender
+	}
 	if !fetched.DateReceived.IsZero() {
 		out.DateReceived = fetched.DateReceived
-	}
-	if fetched.BodyType != eas.BodyTypeNone {
-		out.BodyType = fetched.BodyType
-	}
-	if fetched.Body != "" {
-		out.Body = fetched.Body
 	}
 	if fetched.BodyEstimatedSize != 0 {
 		out.BodyEstimatedSize = fetched.BodyEstimatedSize
 	}
-	out.BodyTruncated = fetched.BodyTruncated
 	if len(fetched.Attachments) > 0 {
 		out.Attachments = fetched.Attachments
 	}
 	out.HasAttachments = out.HasAttachments || fetched.HasAttachments || len(out.Attachments) > 0
+	if fetched.ThreadTopic != "" {
+		out.ThreadTopic = fetched.ThreadTopic
+	}
+	if len(fetched.ConversationID) > 0 {
+		out.ConversationID = fetched.ConversationID
+	}
+	if fetched.MessageClass != "" {
+		out.MessageClass = fetched.MessageClass
+	}
+	if fetched.BodyPreview != "" {
+		out.BodyPreview = fetched.BodyPreview
+	}
+	if len(fetched.Categories) > 0 {
+		out.Categories = fetched.Categories
+	}
 	return out
 }
 
 func constructRFC822(item eas.EmailItem) []byte {
-	return constructRFC822WithAttachments(item, item.ServerID, nil)
+	return constructRFC822Message(item, "", item.ServerID, nil)
 }
 
 func constructRFC822WithAttachments(item eas.EmailItem, seed string, attachments []mailAttachment) []byte {
+	for i := range attachments {
+		attachments[i].index = i
+	}
+	return constructRFC822Message(item, "", seed, attachments)
+}
+
+func constructRFC822Message(item eas.EmailItem, plainBody, seed string, attachments []mailAttachment) []byte {
+	root := buildMIMEEntity(item, plainBody, seed, attachments)
 	var buf bytes.Buffer
-	writeHeader := func(name, value string) {
-		if value != "" {
-			fmt.Fprintf(&buf, "%s: %s\r\n", name, sanitizeHeader(value))
-		}
+	if err := writeRFC822(&buf, item, seed, root, mimeRenderOptions{
+		actualAttachments: allAttachmentIndices(root),
+	}); err != nil {
+		return nil
 	}
-
-	writeHeader("From", formatAddressHeader(item.From))
-	writeHeader("To", formatAddressHeader(item.To))
-	writeHeader("Cc", formatAddressHeader(item.Cc))
-	writeHeader("Reply-To", formatAddressHeader(item.ReplyTo))
-	writeHeader("Subject", encodeHeaderWord(item.Subject))
-	if !item.DateReceived.IsZero() {
-		writeHeader("Date", item.DateReceived.Format("Mon, 02 Jan 2006 15:04:05 -0700"))
-	}
-	if seed != "" {
-		sum := sha256.Sum256([]byte(seed))
-		writeHeader("Message-ID", "<"+hex.EncodeToString(sum[:12])+"@eas-bridge.local>")
-	}
-	writeHeader("MIME-Version", "1.0")
-
-	entity := buildMIMEEntity(item, seed, attachments)
-	entity.writeTo(&buf)
 	return buf.Bytes()
 }
 
-func buildMIMEEntity(item eas.EmailItem, seed string, attachments []mailAttachment) mimeEntity {
+func writeRFC822(w io.Writer, item eas.EmailItem, seed string, root mimeEntity, opts mimeRenderOptions) error {
+	writeHeader := func(name, value string) error {
+		if value == "" {
+			return nil
+		}
+		_, err := fmt.Fprintf(w, "%s: %s\r\n", name, sanitizeHeader(value))
+		return err
+	}
+
+	for _, header := range [][2]string{
+		{"From", formatAddressHeader(item.From)},
+		{"To", formatAddressHeader(item.To)},
+		{"Cc", formatAddressHeader(item.Cc)},
+		{"Reply-To", formatAddressHeader(item.ReplyTo)},
+		{"Subject", encodeHeaderWord(item.Subject)},
+	} {
+		if err := writeHeader(header[0], header[1]); err != nil {
+			return err
+		}
+	}
+	if !item.DateReceived.IsZero() {
+		if err := writeHeader("Date", item.DateReceived.Format("Mon, 02 Jan 2006 15:04:05 -0700")); err != nil {
+			return err
+		}
+	}
+	if seed != "" {
+		sum := sha256.Sum256([]byte(seed))
+		if err := writeHeader("Message-ID", "<"+hex.EncodeToString(sum[:12])+"@eas-bridge.local>"); err != nil {
+			return err
+		}
+	}
+	if err := writeHeader("MIME-Version", "1.0"); err != nil {
+		return err
+	}
+	return root.writeTo(w, opts)
+}
+
+func buildMIMEEntity(item eas.EmailItem, plainBody, seed string, attachments []mailAttachment) mimeEntity {
 	bodyType := "text/plain"
 	if item.BodyType == eas.BodyTypeHTML {
 		bodyType = "text/html"
@@ -190,14 +287,22 @@ func buildMIMEEntity(item eas.EmailItem, seed string, attachments []mailAttachme
 	if body == "" {
 		body = "(no body)"
 	}
-	bodyEntity := mimeEntity{
-		contentType:      mime.FormatMediaType(bodyType, map[string]string{"charset": "utf-8"}),
-		transferEncoding: "quoted-printable",
-		body:             []byte(body),
+	htmlOrPlain := textEntity(bodyType, body)
+	content := htmlOrPlain
+	if bodyType == "text/html" && plainBody != "" {
+		plain := textEntity("text/plain", plainBody)
+		content = mimeEntity{
+			contentType: mime.FormatMediaType("multipart/alternative", map[string]string{
+				"boundary": mimeBoundary(seed, "alternative"),
+			}),
+			boundary: mimeBoundary(seed, "alternative"),
+			children: []mimeEntity{plain, htmlOrPlain},
+		}
 	}
 
 	var inline, regular []mimeEntity
-	for _, attachment := range attachments {
+	for i := range attachments {
+		attachment := attachments[i]
 		entity := attachmentEntity(attachment)
 		if attachment.meta.IsInline || attachment.meta.Method == 6 || attachment.meta.ContentID != "" {
 			inline = append(inline, entity)
@@ -206,15 +311,14 @@ func buildMIMEEntity(item eas.EmailItem, seed string, attachments []mailAttachme
 		}
 	}
 
-	content := bodyEntity
 	if len(inline) > 0 {
 		content = mimeEntity{
 			contentType: mime.FormatMediaType("multipart/related", map[string]string{
 				"boundary": mimeBoundary(seed, "related"),
-				"type":     bodyType,
+				"type":     content.mediaType(),
 			}),
 			boundary: mimeBoundary(seed, "related"),
-			children: append([]mimeEntity{bodyEntity}, inline...),
+			children: append([]mimeEntity{content}, inline...),
 		}
 	}
 	if len(regular) > 0 {
@@ -227,6 +331,14 @@ func buildMIMEEntity(item eas.EmailItem, seed string, attachments []mailAttachme
 		}
 	}
 	return content
+}
+
+func textEntity(mediaType, body string) mimeEntity {
+	return mimeEntity{
+		contentType:      mime.FormatMediaType(mediaType, map[string]string{"charset": "utf-8"}),
+		transferEncoding: "quoted-printable",
+		body:             []byte(body),
+	}
 }
 
 func attachmentEntity(attachment mailAttachment) mimeEntity {
@@ -244,75 +356,167 @@ func attachmentEntity(attachment mailAttachment) mimeEntity {
 	if name != "" {
 		dispositionParams["filename"] = name
 	}
+	attachmentCopy := attachment
 	return mimeEntity{
 		contentType:      mime.FormatMediaType(contentType, contentTypeParams),
 		transferEncoding: "base64",
 		disposition:      mime.FormatMediaType(disposition, dispositionParams),
 		contentID:        normalizeContentID(attachment.meta.ContentID),
 		contentLocation:  sanitizeHeader(attachment.meta.ContentLocation),
-		body:             attachment.data,
+		attachment:       &attachmentCopy,
 	}
 }
 
-func (entity mimeEntity) writeTo(buf *bytes.Buffer) {
-	fmt.Fprintf(buf, "Content-Type: %s\r\n", entity.contentType)
-	if entity.transferEncoding != "" {
-		fmt.Fprintf(buf, "Content-Transfer-Encoding: %s\r\n", entity.transferEncoding)
+func (entity mimeEntity) mediaType() string {
+	mediaType, _, err := mime.ParseMediaType(entity.contentType)
+	if err != nil {
+		return "application/octet-stream"
 	}
-	if entity.disposition != "" {
-		fmt.Fprintf(buf, "Content-Disposition: %s\r\n", entity.disposition)
+	return mediaType
+}
+
+func (entity mimeEntity) writeTo(w io.Writer, opts mimeRenderOptions) error {
+	if _, err := fmt.Fprintf(w, "Content-Type: %s\r\n", entity.contentType); err != nil {
+		return err
+	}
+	for _, header := range [][2]string{
+		{"Content-Transfer-Encoding", entity.transferEncoding},
+		{"Content-Disposition", entity.disposition},
+	} {
+		if header[1] != "" {
+			if _, err := fmt.Fprintf(w, "%s: %s\r\n", header[0], header[1]); err != nil {
+				return err
+			}
+		}
 	}
 	if entity.contentID != "" {
-		fmt.Fprintf(buf, "Content-ID: <%s>\r\n", entity.contentID)
+		if _, err := fmt.Fprintf(w, "Content-ID: <%s>\r\n", entity.contentID); err != nil {
+			return err
+		}
 	}
 	if entity.contentLocation != "" {
-		fmt.Fprintf(buf, "Content-Location: %s\r\n", entity.contentLocation)
+		if _, err := fmt.Fprintf(w, "Content-Location: %s\r\n", entity.contentLocation); err != nil {
+			return err
+		}
 	}
-	buf.WriteString("\r\n")
+	if _, err := io.WriteString(w, "\r\n"); err != nil {
+		return err
+	}
 
 	if len(entity.children) > 0 {
 		for _, child := range entity.children {
-			fmt.Fprintf(buf, "--%s\r\n", entity.boundary)
-			child.writeTo(buf)
-			ensureCRLF(buf)
+			if _, err := fmt.Fprintf(w, "--%s\r\n", entity.boundary); err != nil {
+				return err
+			}
+			if err := child.writeTo(w, opts); err != nil {
+				return err
+			}
 		}
-		fmt.Fprintf(buf, "--%s--\r\n", entity.boundary)
-		return
+		_, err := fmt.Fprintf(w, "--%s--\r\n", entity.boundary)
+		return err
+	}
+
+	if entity.attachment != nil {
+		attachment := entity.attachment
+		if opts.actualAttachments[attachment.index] {
+			data := attachment.data
+			if data == nil && opts.resolveAttachment != nil {
+				var err error
+				data, err = opts.resolveAttachment(attachment.index)
+				if err != nil {
+					return err
+				}
+			}
+			return writeBase64(w, data)
+		}
+		if opts.estimatedPayloads {
+			return writeBase64Placeholder(w, attachment.meta.EstimatedDataSize)
+		}
+		_, err := io.WriteString(w, "\r\n")
+		return err
 	}
 
 	switch entity.transferEncoding {
-	case "base64":
-		writeBase64(buf, entity.body)
 	case "quoted-printable":
-		qp := quotedprintable.NewWriter(buf)
-		_, _ = qp.Write(entity.body)
-		_ = qp.Close()
-		ensureCRLF(buf)
+		qp := quotedprintable.NewWriter(w)
+		if _, err := qp.Write(entity.body); err != nil {
+			_ = qp.Close()
+			return err
+		}
+		if err := qp.Close(); err != nil {
+			return err
+		}
+		_, err := io.WriteString(w, "\r\n")
+		return err
 	default:
-		buf.Write(entity.body)
-		ensureCRLF(buf)
+		if _, err := w.Write(entity.body); err != nil {
+			return err
+		}
+		_, err := io.WriteString(w, "\r\n")
+		return err
 	}
 }
 
-func writeBase64(buf *bytes.Buffer, data []byte) {
+func (entity mimeEntity) entityAtPath(path []int) *mimeEntity {
+	current := &entity
+	if len(current.children) == 0 && len(path) > 0 && path[0] == 1 {
+		path = path[1:]
+	}
+	for _, part := range path {
+		if part <= 0 || part > len(current.children) {
+			return nil
+		}
+		current = &current.children[part-1]
+	}
+	return current
+}
+
+func allAttachmentIndices(entity mimeEntity) map[int]bool {
+	out := make(map[int]bool)
+	var walk func(mimeEntity)
+	walk = func(current mimeEntity) {
+		if current.attachment != nil {
+			out[current.attachment.index] = true
+		}
+		for _, child := range current.children {
+			walk(child)
+		}
+	}
+	walk(entity)
+	return out
+}
+
+func writeBase64(w io.Writer, data []byte) error {
 	encoded := base64.StdEncoding.EncodeToString(data)
 	for len(encoded) > 0 {
 		n := min(76, len(encoded))
-		buf.WriteString(encoded[:n])
-		buf.WriteString("\r\n")
+		if _, err := io.WriteString(w, encoded[:n]+"\r\n"); err != nil {
+			return err
+		}
 		encoded = encoded[n:]
 	}
+	if len(data) == 0 {
+		_, err := io.WriteString(w, "\r\n")
+		return err
+	}
+	return nil
 }
 
-func ensureCRLF(buf *bytes.Buffer) {
-	b := buf.Bytes()
-	if len(b) >= 2 && b[len(b)-2] == '\r' && b[len(b)-1] == '\n' {
-		return
+func writeBase64Placeholder(w io.Writer, rawSize int64) error {
+	if rawSize <= 0 {
+		_, err := io.WriteString(w, "\r\n")
+		return err
 	}
-	if len(b) > 0 && b[len(b)-1] == '\n' {
-		return
+	encodedSize := ((rawSize + 2) / 3) * 4
+	const placeholder = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	for encodedSize > 0 {
+		n := min(int64(len(placeholder)), encodedSize)
+		if _, err := io.WriteString(w, placeholder[:n]+"\r\n"); err != nil {
+			return err
+		}
+		encodedSize -= n
 	}
-	buf.WriteString("\r\n")
+	return nil
 }
 
 func formatAddressHeader(value string) string {

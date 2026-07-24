@@ -73,6 +73,10 @@ type EmailItem struct {
 	FlagStatus     int // 0=clear, 1=complete, 2=active
 	Importance     int // 0=low, 1=normal, 2=high
 	HasAttachments bool
+	// ReadPresent and FlagStatusPresent distinguish an explicit false/clear
+	// value from a field omitted by a sparse Sync Change response.
+	ReadPresent       bool `json:"-"`
+	FlagStatusPresent bool `json:"-"`
 	// Attachments carries the parsed attachment metadata when the server
 	// includes an Attachments element (nil when none / not requested).
 	Attachments    []Attachment
@@ -143,6 +147,7 @@ func parseEmailFieldEmailPage(out *EmailItem, el *wbxml.Element) {
 		out.DateReceived, _ = parseEASTime(el.TextContent())
 	case "Read":
 		out.Read = el.TextContent() == "1"
+		out.ReadPresent = true
 	case "Importance":
 		out.Importance = atoi(el.TextContent())
 	case "ThreadTopic":
@@ -151,6 +156,7 @@ func parseEmailFieldEmailPage(out *EmailItem, el *wbxml.Element) {
 		out.MessageClass = el.TextContent()
 	case "Flag":
 		// FlagStatus lives in the Flag subtree.
+		out.FlagStatusPresent = true
 		if st := el.Find("FlagStatus"); st != nil {
 			out.FlagStatus = atoi(st.TextContent())
 		}

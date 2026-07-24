@@ -1,13 +1,14 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"log"
 	"net"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
@@ -54,7 +55,8 @@ func (d *imapd) broadcast(folderID string) {
 func (d *imapd) Serve(addr string) error {
 	srv := imapserver.New(&imapserver.Options{
 		NewSession: func(conn *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
-			return &imapSession{d: d, conn: conn}, &imapserver.GreetingData{}, nil
+			ctx, cancel := context.WithCancel(context.Background())
+			return &imapSession{d: d, conn: conn, ctx: ctx, cancel: cancel}, &imapserver.GreetingData{}, nil
 		},
 		InsecureAuth: true, // 仅 localhost 监听，无需 TLS
 	})
@@ -69,11 +71,13 @@ func (d *imapd) Serve(addr string) error {
 // ---------- IMAP Session ----------
 
 type imapSession struct {
-	d    *imapd
-	conn *imapserver.Conn
+	d      *imapd
+	conn   *imapserver.Conn
+	ctx    context.Context
+	cancel context.CancelFunc
 
-	selected string         // folderID
-	snap     *mboxSnapshot  // 选中时的快照
+	selected string        // folderID
+	snap     *mboxSnapshot // 选中时的快照
 }
 
 type mboxSnapshot struct {
@@ -83,7 +87,12 @@ type mboxSnapshot struct {
 	uidValidity uint32
 }
 
-func (sess *imapSession) Close() error { return nil }
+func (sess *imapSession) Close() error {
+	if sess.cancel != nil {
+		sess.cancel()
+	}
+	return nil
+}
 
 func (sess *imapSession) Login(username, password string) error {
 	if username != sess.d.engine.cfg.User || password != sess.d.engine.cfg.Password {
@@ -98,11 +107,26 @@ func (sess *imapSession) List(w *imapserver.ListWriter, ref string, patterns []s
 	folders := append([]eas.Folder(nil), st.Folders...)
 	st.mu.Unlock()
 
-	for _, f := range folders {
-		name := easFolderToIMAPName(f)
+	names := imapFolderNames(folders)
+	type namedFolder struct {
+		folder eas.Folder
+		name   string
+	}
+	listed := make([]namedFolder, 0, len(names))
+	for _, folder := range folders {
+		if name := names[folder.ServerID]; name != "" {
+			listed = append(listed, namedFolder{folder: folder, name: name})
+		}
+	}
+	sort.Slice(listed, func(i, j int) bool {
+		return strings.ToLower(listed[i].name) < strings.ToLower(listed[j].name)
+	})
+
+	for _, entry := range listed {
+		name := entry.name
 		match := len(patterns) == 0
 		for _, p := range patterns {
-			if p == "*" || p == "%" || strings.EqualFold(p, name) {
+			if imapserver.MatchList(name, '/', ref, p) {
 				match = true
 				break
 			}
@@ -110,9 +134,19 @@ func (sess *imapSession) List(w *imapserver.ListWriter, ref string, patterns []s
 		if !match {
 			continue
 		}
+		attrs := []imap.MailboxAttr{imap.MailboxAttrHasNoChildren}
+		for _, other := range listed {
+			if strings.HasPrefix(other.name, name+"/") {
+				attrs[0] = imap.MailboxAttrHasChildren
+				break
+			}
+		}
+		if specialUse := folderSpecialUse(entry.folder.Type); specialUse != "" {
+			attrs = append(attrs, specialUse)
+		}
 		if err := w.WriteList(&imap.ListData{
 			Mailbox: name,
-			Attrs:   []imap.MailboxAttr{imap.MailboxAttrHasNoChildren},
+			Attrs:   attrs,
 			Delim:   '/',
 		}); err != nil {
 			return err
@@ -121,9 +155,13 @@ func (sess *imapSession) List(w *imapserver.ListWriter, ref string, patterns []s
 	return nil
 }
 
-func (sess *imapSession) Create(mailbox string, options *imap.CreateOptions) error { return errNotSupported("CREATE") }
+func (sess *imapSession) Create(mailbox string, options *imap.CreateOptions) error {
+	return errNotSupported("CREATE")
+}
 func (sess *imapSession) Delete(mailbox string) error { return errNotSupported("DELETE") }
-func (sess *imapSession) Rename(mailbox, newName string, options *imap.RenameOptions) error { return errNotSupported("RENAME") }
+func (sess *imapSession) Rename(mailbox, newName string, options *imap.RenameOptions) error {
+	return errNotSupported("RENAME")
+}
 func (sess *imapSession) Subscribe(mailbox string) error   { return nil }
 func (sess *imapSession) Unsubscribe(mailbox string) error { return nil }
 
@@ -132,7 +170,8 @@ func (sess *imapSession) Status(mailbox string, options *imap.StatusOptions) (*i
 	if !ok {
 		return nil, fmt.Errorf("不存在的文件夹: %s", mailbox)
 	}
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(sess.ctx, 90*time.Second)
+	defer cancel()
 	if err := sess.d.engine.syncMail(ctx, folder.ServerID); err != nil {
 		return nil, fmt.Errorf("同步失败: %w", err)
 	}
@@ -148,11 +187,11 @@ func (sess *imapSession) Status(mailbox string, options *imap.StatusOptions) (*i
 	}
 	next := imap.UID(st.FolderMeta[folder.ServerID].NextUID)
 	return &imap.StatusData{
-		Mailbox:       mailbox,
-		NumMessages:   uint32Ptr(uint32(len(items))),
-		UIDValidity:   st.FolderMeta[folder.ServerID].UIDValidity,
-		UIDNext:       next,
-		NumUnseen:     uint32Ptr(unseen),
+		Mailbox:     mailbox,
+		NumMessages: uint32Ptr(uint32(len(items))),
+		UIDValidity: st.FolderMeta[folder.ServerID].UIDValidity,
+		UIDNext:     next,
+		NumUnseen:   uint32Ptr(unseen),
 	}, nil
 }
 
@@ -161,7 +200,8 @@ func (sess *imapSession) Select(mailbox string, options *imap.SelectOptions) (*i
 	if !ok {
 		return nil, fmt.Errorf("不存在的文件夹: %s", mailbox)
 	}
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(sess.ctx, 90*time.Second)
+	defer cancel()
 	if err := sess.d.engine.syncMail(ctx, folder.ServerID); err != nil {
 		return nil, fmt.Errorf("同步失败: %w", err)
 	}
@@ -214,9 +254,11 @@ func (sess *imapSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, op
 	}
 	snap := sess.snap
 	engine := sess.d.engine
+	ctx, cancel := context.WithTimeout(sess.ctx, 5*time.Minute)
+	defer cancel()
 
 	// 按 NumSet 类型解析消息序列
-	forEachItem(numSet, snap, func(seqNum uint32, item eas.EmailItem) error {
+	return forEachItem(numSet, snap, func(seqNum uint32, item eas.EmailItem) error {
 		uid := snap.uidForSID[item.ServerID]
 		rw := w.CreateMessage(seqNum)
 		rw.WriteUID(imap.UID(uid))
@@ -230,23 +272,34 @@ func (sess *imapSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, op
 		if options.Envelope {
 			rw.WriteEnvelope(buildEnvelope(item))
 		}
+		needsMessage := options.RFC822Size || options.BodyStructure != nil || len(options.BodySection) > 0
+		var plan *messagePlan
+		if needsMessage {
+			var err error
+			plan, err = engine.prepareMessage(ctx, sess.selected, item.ServerID)
+			if err != nil {
+				return err
+			}
+		}
 		if options.RFC822Size {
-			mimeBytes, _ := engine.fetchMIME(context.Background(), sess.selected, item.ServerID)
-			rw.WriteRFC822Size(int64(len(mimeBytes)))
+			size, err := plan.estimatedRFC822Size(ctx, engine)
+			if err != nil {
+				return err
+			}
+			rw.WriteRFC822Size(size)
 		}
 		if options.BodyStructure != nil {
-			mimeBytes, err := engine.fetchMIME(context.Background(), sess.selected, item.ServerID)
+			structure, err := plan.bodyStructure(ctx, engine)
 			if err != nil {
 				return err
 			}
-			rw.WriteBodyStructure(imapserver.ExtractBodyStructure(bytes.NewReader(mimeBytes)))
+			rw.WriteBodyStructure(structure)
 		}
 		for _, bs := range options.BodySection {
-			mimeBytes, err := engine.fetchMIME(context.Background(), sess.selected, item.ServerID)
+			buf, err := plan.bodySection(ctx, engine, bs)
 			if err != nil {
 				return err
 			}
-			buf := imapserver.ExtractBodySection(bytes.NewReader(mimeBytes), bs)
 			wc := rw.WriteBodySection(bs, int64(len(buf)))
 			if _, err := wc.Write(buf); err != nil {
 				return err
@@ -257,7 +310,6 @@ func (sess *imapSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, op
 		}
 		return rw.Close()
 	})
-	return nil
 }
 
 func (sess *imapSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, storeFlags *imap.StoreFlags, options *imap.StoreOptions) error {
@@ -274,9 +326,13 @@ func (sess *imapSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, st
 			if f == "\\Seen" {
 				switch storeFlags.Op {
 				case imap.StoreFlagsSet, imap.StoreFlagsAdd:
-					st.markRead(sess.selected, serverID)
+					if err := st.markRead(sess.selected, serverID); err != nil {
+						return err
+					}
 				case imap.StoreFlagsDel:
-					st.markUnread(sess.selected, serverID)
+					if err := st.markUnread(sess.selected, serverID); err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -310,27 +366,23 @@ func (sess *imapSession) Search(numKind imapserver.NumKind, criteria *imap.Searc
 			break
 		}
 	}
-	var allIDs imap.UIDSet
-	for _, it := range snap.items {
-		if unseenOnly && it.Read {
-			continue
-		}
-		uid := snap.uidForSID[it.ServerID]
-		allIDs.AddNum(imap.UID(uid))
-	}
 	data := &imap.SearchData{}
 	switch numKind {
 	case imapserver.NumKindSeq:
 		var seqSet imap.SeqSet
 		for i, it := range snap.items {
-			if unseenOnly && it.Read { continue }
-			seqSet.AddNum(uint32(i+1))
+			if unseenOnly && it.Read {
+				continue
+			}
+			seqSet.AddNum(uint32(i + 1))
 		}
 		data.All = seqSet
 	case imapserver.NumKindUID:
 		var uidSet imap.UIDSet
 		for _, it := range snap.items {
-			if unseenOnly && it.Read { continue }
+			if unseenOnly && it.Read {
+				continue
+			}
 			uidSet.AddNum(imap.UID(snap.uidForSID[it.ServerID]))
 		}
 		data.All = uidSet
@@ -401,18 +453,16 @@ func (sess *imapSession) Idle(w *imapserver.UpdateWriter, stop <-chan struct{}) 
 
 // ---------- 辅助 ----------
 
-func easFolderToIMAPName(f eas.Folder) string {
-	switch f.Type {
-	case eas.FolderTypeInbox:
-		return "INBOX"
+func folderSpecialUse(folderType eas.FolderType) imap.MailboxAttr {
+	switch folderType {
 	case eas.FolderTypeSentItems:
-		return "Sent"
+		return imap.MailboxAttrSent
 	case eas.FolderTypeDrafts:
-		return "Drafts"
+		return imap.MailboxAttrDrafts
 	case eas.FolderTypeDeletedItems:
-		return "Trash"
+		return imap.MailboxAttrTrash
 	default:
-		return f.DisplayName
+		return ""
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +33,7 @@ type caldavBackend struct {
 
 	calMu       sync.Mutex
 	lastCalSync time.Time
+	calSyncing  bool
 }
 
 // ---------- Backend 接口 ----------
@@ -120,18 +122,44 @@ func (b *caldavBackend) DeleteCalendarObject(ctx context.Context, path string) e
 
 // ---------- 内部 ----------
 
-// maybeSyncCalendar TTL 门控同步：TTL 内直接返回；过期则阻塞增量同步一次。
+// maybeSyncCalendar uses stale-while-revalidate: when cached events exist, an
+// expired cache is refreshed in the background so CalDAV reads stay responsive.
 func (b *caldavBackend) maybeSyncCalendar(ctx context.Context) error {
 	b.calMu.Lock()
-	defer b.calMu.Unlock()
 	if time.Since(b.lastCalSync) < calSyncTTL {
+		b.calMu.Unlock()
 		return nil
 	}
-	if err := b.engine.syncCalendar(ctx); err != nil {
-		return err
+	if b.calSyncing {
+		b.calMu.Unlock()
+		return nil
 	}
-	b.lastCalSync = time.Now()
-	return nil
+	b.engine.st.mu.Lock()
+	hasCachedEvents := len(b.engine.st.Events) > 0
+	b.engine.st.mu.Unlock()
+	b.calSyncing = true
+	b.calMu.Unlock()
+
+	if hasCachedEvents {
+		go func() {
+			syncCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			defer cancel()
+			b.finishCalendarSync(b.engine.syncCalendar(syncCtx))
+		}()
+		return nil
+	}
+	err := b.engine.syncCalendar(ctx)
+	b.finishCalendarSync(err)
+	return err
+}
+
+func (b *caldavBackend) finishCalendarSync(err error) {
+	b.calMu.Lock()
+	defer b.calMu.Unlock()
+	b.calSyncing = false
+	if err == nil {
+		b.lastCalSync = time.Now()
+	}
 }
 
 // allObjects 把缓存中全部事件转成 CalendarObject（按 StartTime 排序，稳定输出）。
@@ -142,12 +170,12 @@ func (b *caldavBackend) allObjects() []caldav.CalendarObject {
 		events = append(events, ev)
 	}
 	b.engine.st.mu.Unlock()
-	// 简单插入排序按开始时间
-	for i := 1; i < len(events); i++ {
-		for j := i; j > 0 && events[j].StartTime.Before(events[j-1].StartTime); j-- {
-			events[j], events[j-1] = events[j-1], events[j]
+	sort.Slice(events, func(i, j int) bool {
+		if events[i].StartTime.Equal(events[j].StartTime) {
+			return events[i].ServerID < events[j].ServerID
 		}
-	}
+		return events[i].StartTime.Before(events[j].StartTime)
+	})
 	objs := make([]caldav.CalendarObject, 0, len(events))
 	for _, ev := range events {
 		objs = append(objs, *eventToCalendarObject(ev))

@@ -39,6 +39,12 @@ func (c *fakeMessageContentClient) FetchEmail(_ context.Context, _, serverID str
 			},
 			HasAttachments: true,
 		}, nil
+	case eas.BodyTypePlain:
+		return &eas.EmailItem{
+			ServerID: serverID,
+			BodyType: eas.BodyTypePlain,
+			Body:     "标题",
+		}, nil
 	default:
 		return nil, nil
 	}
@@ -67,7 +73,7 @@ func TestFetchAndBuildMIMEFallsBackToHTMLAndAttachments(t *testing.T) {
 	if !complete {
 		t.Fatal("complete = false, want true")
 	}
-	if want := []eas.BodyType{eas.BodyTypeMIME, eas.BodyTypeHTML}; !equalBodyTypes(client.fetches, want) {
+	if want := []eas.BodyType{eas.BodyTypeMIME, eas.BodyTypeHTML, eas.BodyTypePlain}; !equalBodyTypes(client.fetches, want) {
 		t.Fatalf("FetchEmail body types = %v, want %v", client.fetches, want)
 	}
 	if got, want := strings.Join(client.attachments, ","), "inline-ref,file-ref"; got != want {
@@ -87,6 +93,7 @@ func TestFetchAndBuildMIMEFallsBackToHTMLAndAttachments(t *testing.T) {
 	}
 
 	leaves := collectLeaves(t, textproto.MIMEHeader(msg.Header), msg.Body)
+	assertLeaf(t, leaves, "text/plain", "", "", []byte("标题"))
 	assertLeaf(t, leaves, "text/html", "", "", []byte(`<html><body><h1>标题</h1><img src="cid:logo"></body></html>`))
 	assertLeaf(t, leaves, "image/png", "inline", "logo.png", []byte("data:inline-ref"))
 	assertLeaf(t, leaves, "application/pdf", "attachment", "报告.pdf", []byte("data:file-ref"))
@@ -108,16 +115,6 @@ func TestConstructRFC822PlainText(t *testing.T) {
 	}
 	leaves := collectLeaves(t, textproto.MIMEHeader(msg.Header), msg.Body)
 	assertLeaf(t, leaves, "text/plain", "", "", []byte("第一行\r\n第二行"))
-}
-
-func TestMIMECacheFilenameIsVersionedAndPathSafe(t *testing.T) {
-	got := mimeCacheFilename("../../message/id")
-	if strings.Contains(got, "/") || strings.Contains(got, "..") {
-		t.Fatalf("unsafe cache filename %q", got)
-	}
-	if !strings.HasSuffix(got, ".eml") {
-		t.Fatalf("cache filename %q has no .eml suffix", got)
-	}
 }
 
 func collectLeaves(t *testing.T, header textproto.MIMEHeader, body io.Reader) []parsedLeaf {

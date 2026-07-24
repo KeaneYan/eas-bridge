@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -15,8 +15,8 @@ import (
 
 // uidEntry 将一个 EAS serverID 映射到一个稳定的 IMAP UID。
 type uidEntry struct {
-	ServerID string   `json:"sid"`
-	UID      uint32   `json:"uid"`
+	ServerID string `json:"sid"`
+	UID      uint32 `json:"uid"`
 }
 
 // folderMeta 每个文件夹的 UID 管理元数据。
@@ -90,11 +90,7 @@ func (s *diskState) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.path)
+	return atomicWriteFile(s.path, b, 0600)
 }
 
 // mutate 持锁执行 fn 并原子落盘。
@@ -124,7 +120,10 @@ func (s *diskState) SyncKey(_ context.Context, folderID string) (string, error) 
 }
 
 func (s *diskState) SetSyncKey(_ context.Context, folderID, key string) error {
-	return s.mutate(func() { s.SyncKeys[folderID] = key })
+	s.mu.Lock()
+	s.SyncKeys[folderID] = key
+	s.mu.Unlock()
+	return nil
 }
 
 // ---------- IMAP UID 管理 ----------
@@ -172,12 +171,7 @@ func (s *diskState) assignUIDs(folderID string, items []eas.EmailItem) []eas.Ema
 	for _, it := range items {
 		tagged = append(tagged, withUID{it, sidMap[it.ServerID]})
 	}
-	// 稳定排序：按 UID 升序
-	for i := 1; i < len(tagged); i++ {
-		for j := i; j > 0 && tagged[j].uid < tagged[j-1].uid; j-- {
-			tagged[j], tagged[j-1] = tagged[j-1], tagged[j]
-		}
-	}
+	sort.Slice(tagged, func(i, j int) bool { return tagged[i].uid < tagged[j].uid })
 	result := make([]eas.EmailItem, len(tagged))
 	for i, t := range tagged {
 		result[i] = t.item
@@ -267,10 +261,4 @@ func (s *diskState) markUnread(folderID, serverID string) error {
 		}
 	}
 	return s.saveLocked()
-}
-
-// ensureMIMECacheDir 确保 MIME 缓存目录存在。
-func ensureMIMECacheDir(folderID string) (string, error) {
-	dir := filepath.Join(mimeCacheDir(), folderID)
-	return dir, os.MkdirAll(dir, 0700)
 }
