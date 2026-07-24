@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.keaneyan.eas-bridge</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/keaneyan/eas-bridge/eas-bridge</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/Users/keaneyan/eas-bridge</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HTTPS_PROXY</key>
+		<string>http://127.0.0.1:7897</string>
+		<key>HTTP_PROXY</key>
+		<string>http://127.0.0.1:7897</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/Users/keaneyan/Library/Logs/eas-bridge.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/keaneyan/Library/Logs/eas-bridge.log</string>
+</dict>
+</plist>

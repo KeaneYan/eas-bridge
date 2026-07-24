@@ -47,6 +47,27 @@ go build -o eas-bridge .
 }
 ```
 
+## 后台常驻（launchd，推荐）
+
+`contrib/com.keaneyan.eas-bridge.plist` 是 macOS launchd 服务配置（开机自启 + 崩溃自动拉起，日志到 `~/Library/Logs/eas-bridge.log`）：
+
+```bash
+# 安装（首次）
+cp contrib/com.keaneyan.eas-bridge.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.keaneyan.eas-bridge.plist
+
+# 代码更新后：重新编译并重启服务才会用上新二进制
+go build -o eas-bridge .
+launchctl kickstart -k gui/$(id -u)/com.keaneyan.eas-bridge
+
+# 日常管理
+launchctl stop com.keaneyan.eas-bridge     # 停（会被 KeepAlive 拉起，彻底停用用 unload）
+launchctl unload ~/Library/LaunchAgents/com.keaneyan.eas-bridge.plist  # 停用
+tail -f ~/Library/Logs/eas-bridge.log      # 看日志
+```
+
+注意：plist 中 `ProgramArguments`/`WorkingDirectory` 写死了本仓库绝对路径，移动仓库目录后需同步修改。
+
 ## Apple Mail 配置
 
 添加账户 → 其他邮件账户：
