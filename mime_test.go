@@ -63,6 +63,30 @@ type parsedLeaf struct {
 	body        []byte
 }
 
+type bodyScenarioClient struct {
+	html     *eas.EmailItem
+	htmlErr  error
+	plain    *eas.EmailItem
+	plainErr error
+}
+
+func (c *bodyScenarioClient) FetchEmail(_ context.Context, _, serverID string, opts eas.FetchEmailOptions) (*eas.EmailItem, error) {
+	switch opts.BodyType {
+	case eas.BodyTypeMIME:
+		return &eas.EmailItem{ServerID: serverID}, nil
+	case eas.BodyTypeHTML:
+		return c.html, c.htmlErr
+	case eas.BodyTypePlain:
+		return c.plain, c.plainErr
+	default:
+		return nil, nil
+	}
+}
+
+func (*bodyScenarioClient) FetchAttachment(context.Context, string, int64, int64) (*eas.FetchAttachmentResult, error) {
+	return nil, nil
+}
+
 func TestFetchAndBuildMIMEFallsBackToHTMLAndAttachments(t *testing.T) {
 	client := &fakeMessageContentClient{}
 	got, complete := fetchAndBuildMIME(context.Background(), client, "inbox", "message-1", eas.EmailItem{
@@ -115,6 +139,131 @@ func TestConstructRFC822PlainText(t *testing.T) {
 	}
 	leaves := collectLeaves(t, textproto.MIMEHeader(msg.Header), msg.Body)
 	assertLeaf(t, leaves, "text/plain", "", "", []byte("第一行\r\n第二行"))
+}
+
+func TestTruncatedHTMLIsNotOverwrittenOrCached(t *testing.T) {
+	client := &bodyScenarioClient{
+		html: &eas.EmailItem{
+			ServerID:      "message",
+			BodyType:      eas.BodyTypeHTML,
+			Body:          "<p>truncated HTML</p>",
+			BodyTruncated: true,
+		},
+		plain: &eas.EmailItem{
+			ServerID: "message",
+			BodyType: eas.BodyTypePlain,
+			Body:     "complete plain text",
+		},
+	}
+	source, err := fetchMessageSource(context.Background(), client, "inbox", "message", eas.EmailItem{ServerID: "message"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source.Item.BodyType != eas.BodyTypeHTML || source.Item.Body != "<p>truncated HTML</p>" {
+		t.Fatalf("HTML was overwritten: %+v", source.Item)
+	}
+	if source.PlainBody != "complete plain text" {
+		t.Fatalf("PlainBody = %q", source.PlainBody)
+	}
+	if source.Complete {
+		t.Fatal("truncated HTML source must not be cached")
+	}
+}
+
+func TestMalformedUnicodeAddressFallbackIsRFC2047Safe(t *testing.T) {
+	got := constructRFC822(eas.EmailItem{
+		ServerID: "address",
+		From:     "Doe, 张三 <sender@example.com>",
+		To:       "receiver@example.com",
+		BodyType: eas.BodyTypePlain,
+		Body:     "body",
+	})
+	headerEnd := bytes.Index(got, []byte("\r\n\r\n"))
+	if headerEnd < 0 {
+		t.Fatal("missing header terminator")
+	}
+	for _, b := range got[:headerEnd] {
+		if b >= 0x80 {
+			t.Fatalf("header contains raw UTF-8 byte 0x%x", b)
+		}
+	}
+	msg, err := mail.ReadMessage(bytes.NewReader(got))
+	if err != nil {
+		t.Fatal(err)
+	}
+	address, err := mail.ParseAddress(msg.Header.Get("From"))
+	if err != nil {
+		t.Fatalf("ParseAddress: %v; header=%q", err, msg.Header.Get("From"))
+	}
+	if address.Name != "Doe, 张三" || address.Address != "sender@example.com" {
+		t.Fatalf("From = %+v", address)
+	}
+}
+
+func TestContentIDOnlyIsInlineWhenReferenced(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		body        string
+		disposition string
+	}{
+		{name: "unreferenced", body: "<p>no image</p>", disposition: "attachment"},
+		{name: "referenced", body: `<img src="cid:asset-id">`, disposition: "inline"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			item := eas.EmailItem{
+				ServerID: "message",
+				BodyType: eas.BodyTypeHTML,
+				Body:     test.body,
+			}
+			got := constructRFC822WithAttachments(item, "message", []mailAttachment{{
+				meta: eas.Attachment{
+					DisplayName:   "asset.bin",
+					FileReference: "asset",
+					ContentID:     "asset-id",
+				},
+				data: []byte("asset"),
+			}})
+			msg, err := mail.ReadMessage(bytes.NewReader(got))
+			if err != nil {
+				t.Fatal(err)
+			}
+			leaves := collectLeaves(t, textproto.MIMEHeader(msg.Header), msg.Body)
+			assertLeaf(t, leaves, "application/octet-stream", test.disposition, "asset.bin", []byte("asset"))
+		})
+	}
+}
+
+func TestMergeEmailMetadataUnionsAttachments(t *testing.T) {
+	base := eas.EmailItem{
+		Attachments: []eas.Attachment{
+			{FileReference: "one", DisplayName: "one.bin", EstimatedDataSize: 10},
+			{FileReference: "two", DisplayName: "two.bin"},
+		},
+	}
+	fetched := eas.EmailItem{
+		Attachments: []eas.Attachment{
+			{FileReference: "one", ContentType: "application/one"},
+			{FileReference: "three", DisplayName: "three.bin"},
+		},
+	}
+	got := mergeEmailMetadata(base, fetched)
+	if len(got.Attachments) != 3 {
+		t.Fatalf("attachments = %+v", got.Attachments)
+	}
+	if got.Attachments[0].DisplayName != "one.bin" ||
+		got.Attachments[0].ContentType != "application/one" ||
+		got.Attachments[0].EstimatedDataSize != 10 {
+		t.Fatalf("merged attachment = %+v", got.Attachments[0])
+	}
+	if got.Attachments[1].FileReference != "two" || got.Attachments[2].FileReference != "three" {
+		t.Fatalf("attachment union order = %+v", got.Attachments)
+	}
+}
+
+func TestSanitizeFilenameRejectsDotDot(t *testing.T) {
+	if got := sanitizeFilename("../.."); got != "" {
+		t.Fatalf("sanitizeFilename = %q", got)
+	}
 }
 
 func collectLeaves(t *testing.T, header textproto.MIMEHeader, body io.Reader) []parsedLeaf {

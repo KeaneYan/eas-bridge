@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -118,5 +121,77 @@ func TestDownloadAttachmentUsesRangesForLargeFiles(t *testing.T) {
 	}
 	if len(ranges) != 3 {
 		t.Fatalf("range requests = %v, want 3 chunks", ranges)
+	}
+}
+
+func TestFailedBodyFetchIsNotCachedAndRetries(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st, err := loadState(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Folders = []eas.Folder{{ServerID: "inbox", Type: eas.FolderTypeInbox}}
+	st.Items["inbox"] = []eas.EmailItem{{
+		ServerID: "message",
+		BodyType: eas.BodyTypePlain,
+		Body:     "synchronized summary",
+	}}
+
+	htmlCalls := 0
+	engine := &syncEngine{
+		st: st,
+		c: &easmock.Client{
+			EmailClient: easmock.EmailClient{
+				FetchEmailFunc: func(_ context.Context, _, serverID string, opts eas.FetchEmailOptions) (*eas.EmailItem, error) {
+					switch opts.BodyType {
+					case eas.BodyTypeMIME:
+						return &eas.EmailItem{ServerID: serverID}, nil
+					case eas.BodyTypeHTML:
+						htmlCalls++
+						if htmlCalls == 1 {
+							return nil, errors.New("temporary HTML failure")
+						}
+						return &eas.EmailItem{
+							ServerID: serverID,
+							BodyType: eas.BodyTypeHTML,
+							Body:     "<p>complete HTML</p>",
+						}, nil
+					case eas.BodyTypePlain:
+						return &eas.EmailItem{
+							ServerID: serverID,
+							BodyType: eas.BodyTypePlain,
+							Body:     "complete plain text",
+						}, nil
+					default:
+						return nil, nil
+					}
+				},
+			},
+		},
+	}
+
+	first, err := engine.prepareMessage(context.Background(), "inbox", "message")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.cacheable {
+		t.Fatal("failed body fetch produced a cacheable plan")
+	}
+	if _, err := os.Stat(messageMetadataPath("inbox", "message")); !os.IsNotExist(err) {
+		t.Fatalf("incomplete metadata cache exists: %v", err)
+	}
+
+	second, err := engine.prepareMessage(context.Background(), "inbox", "message")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.cacheable || second.item.BodyType != eas.BodyTypeHTML || second.item.Body != "<p>complete HTML</p>" {
+		t.Fatalf("retry did not fetch complete HTML: %+v", second)
+	}
+	if htmlCalls != 2 {
+		t.Fatalf("HTML fetch calls = %d, want 2", htmlCalls)
+	}
+	if _, err := os.Stat(messageMetadataPath("inbox", "message")); err != nil {
+		t.Fatalf("complete metadata was not cached: %v", err)
 	}
 }

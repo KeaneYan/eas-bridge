@@ -37,6 +37,7 @@ type mailAttachment struct {
 	data        []byte
 	contentType string
 	index       int
+	inline      bool
 }
 
 type mimeEntity struct {
@@ -64,21 +65,41 @@ func fetchMessageSource(ctx context.Context, c messageContentClient, folderID, s
 	}
 	if rawErr != nil {
 		log.Printf("[mime] 原始 MIME 不可用，改用 HTML 重建: %v", rawErr)
+	} else {
+		log.Printf("[mime] 服务器返回的原始 MIME 为空或无效，改用 HTML 重建")
 	}
 
 	item := summary
+	complete := true
 	full, htmlErr := c.FetchEmail(ctx, folderID, serverID, eas.FetchEmailOptions{BodyType: eas.BodyTypeHTML})
 	htmlFetched := htmlErr == nil && full != nil
 	if htmlFetched {
 		item = mergeEmailItem(item, *full)
-	} else if htmlErr != nil {
-		log.Printf("[mime] HTML 正文拉取失败，使用同步缓存: %v", htmlErr)
+		if full.Body == "" && summary.Body != "" {
+			complete = false
+			log.Printf("[mime] HTML 正文响应缺少正文，本次结果不缓存")
+		}
+		if full.BodyTruncated {
+			complete = false
+			log.Printf("[mime] HTML 正文被服务器截断，本次结果不缓存")
+		}
+	} else {
+		complete = false
+		if htmlErr != nil {
+			log.Printf("[mime] HTML 正文拉取失败，使用同步缓存: %v", htmlErr)
+		} else {
+			log.Printf("[mime] HTML 正文响应为空，使用同步缓存")
+		}
 	}
 
 	var plainBody string
 	if item.BodyType == eas.BodyTypeHTML || item.Body == "" || item.BodyTruncated {
 		plain, plainErr := c.FetchEmail(ctx, folderID, serverID, eas.FetchEmailOptions{BodyType: eas.BodyTypePlain})
 		if plainErr == nil && plain != nil {
+			if plain.BodyTruncated {
+				complete = false
+				log.Printf("[mime] 纯文本正文被服务器截断，本次结果不缓存")
+			}
 			if plain.BodyType == eas.BodyTypePlain && plain.Body != "" {
 				plainBody = plain.Body
 			}
@@ -88,16 +109,20 @@ func fetchMessageSource(ctx context.Context, c messageContentClient, folderID, s
 				item.BodyType = eas.BodyTypePlain
 				item.BodyTruncated = plain.BodyTruncated
 			}
-		} else if plainErr != nil {
-			log.Printf("[mime] 完整纯文本正文拉取失败，使用同步缓存: %v", plainErr)
+		} else {
+			complete = false
+			if plainErr != nil {
+				log.Printf("[mime] 完整纯文本正文拉取失败，使用同步缓存: %v", plainErr)
+			} else {
+				log.Printf("[mime] 纯文本正文响应为空，使用同步缓存")
+			}
 		}
 	}
-	bodyComplete := (htmlFetched && !full.BodyTruncated) || (summary.Body != "" && !summary.BodyTruncated)
 	attachmentMetadataComplete := !item.HasAttachments || len(item.Attachments) > 0
 	return messageSource{
 		Item:      item,
 		PlainBody: plainBody,
-		Complete:  bodyComplete && attachmentMetadataComplete,
+		Complete:  complete && attachmentMetadataComplete,
 	}, nil
 }
 
@@ -198,7 +223,7 @@ func mergeEmailMetadata(base, fetched eas.EmailItem) eas.EmailItem {
 		out.BodyEstimatedSize = fetched.BodyEstimatedSize
 	}
 	if len(fetched.Attachments) > 0 {
-		out.Attachments = fetched.Attachments
+		out.Attachments = mergeAttachments(out.Attachments, fetched.Attachments)
 	}
 	out.HasAttachments = out.HasAttachments || fetched.HasAttachments || len(out.Attachments) > 0
 	if fetched.ThreadTopic != "" {
@@ -216,6 +241,54 @@ func mergeEmailMetadata(base, fetched eas.EmailItem) eas.EmailItem {
 	if len(fetched.Categories) > 0 {
 		out.Categories = fetched.Categories
 	}
+	return out
+}
+
+func mergeAttachments(base, fetched []eas.Attachment) []eas.Attachment {
+	out := append([]eas.Attachment(nil), base...)
+	byReference := make(map[string]int, len(out))
+	for i, attachment := range out {
+		if attachment.FileReference != "" {
+			byReference[attachment.FileReference] = i
+		}
+	}
+	for _, attachment := range fetched {
+		if i, ok := byReference[attachment.FileReference]; attachment.FileReference != "" && ok {
+			out[i] = mergeAttachmentMetadata(out[i], attachment)
+			continue
+		}
+		if attachment.FileReference != "" {
+			byReference[attachment.FileReference] = len(out)
+		}
+		out = append(out, attachment)
+	}
+	return out
+}
+
+func mergeAttachmentMetadata(base, fetched eas.Attachment) eas.Attachment {
+	out := base
+	if fetched.DisplayName != "" {
+		out.DisplayName = fetched.DisplayName
+	}
+	if fetched.FileReference != "" {
+		out.FileReference = fetched.FileReference
+	}
+	if fetched.Method != 0 {
+		out.Method = fetched.Method
+	}
+	if fetched.EstimatedDataSize > 0 {
+		out.EstimatedDataSize = fetched.EstimatedDataSize
+	}
+	if fetched.ContentID != "" {
+		out.ContentID = fetched.ContentID
+	}
+	if fetched.ContentLocation != "" {
+		out.ContentLocation = fetched.ContentLocation
+	}
+	if fetched.ContentType != "" {
+		out.ContentType = fetched.ContentType
+	}
+	out.IsInline = out.IsInline || fetched.IsInline
 	return out
 }
 
@@ -303,8 +376,9 @@ func buildMIMEEntity(item eas.EmailItem, plainBody, seed string, attachments []m
 	var inline, regular []mimeEntity
 	for i := range attachments {
 		attachment := attachments[i]
+		attachment.inline = isInlineAttachment(item.Body, attachment.meta)
 		entity := attachmentEntity(attachment)
-		if attachment.meta.IsInline || attachment.meta.Method == 6 || attachment.meta.ContentID != "" {
+		if attachment.inline {
 			inline = append(inline, entity)
 		} else {
 			regular = append(regular, entity)
@@ -349,7 +423,7 @@ func attachmentEntity(attachment mailAttachment) mimeEntity {
 		contentTypeParams["name"] = name
 	}
 	disposition := "attachment"
-	if attachment.meta.IsInline || attachment.meta.Method == 6 || attachment.meta.ContentID != "" {
+	if attachment.inline {
 		disposition = "inline"
 	}
 	dispositionParams := map[string]string{}
@@ -526,11 +600,33 @@ func formatAddressHeader(value string) string {
 	}
 	addresses, err := mail.ParseAddressList(strings.ReplaceAll(value, ";", ","))
 	if err != nil {
-		return value
+		return formatAddressHeaderFallback(value)
 	}
 	formatted := make([]string, 0, len(addresses))
 	for _, address := range addresses {
 		formatted = append(formatted, address.String())
+	}
+	return strings.Join(formatted, ", ")
+}
+
+func formatAddressHeaderFallback(value string) string {
+	parts := strings.Split(value, ";")
+	formatted := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		open := strings.LastIndex(part, "<")
+		if open >= 0 && strings.HasSuffix(part, ">") {
+			displayName := strings.Trim(strings.TrimSpace(part[:open]), "\"'")
+			address := strings.TrimSpace(part[open+1 : len(part)-1])
+			if parsed, err := mail.ParseAddress(address); err == nil && parsed.Address != "" {
+				formatted = append(formatted, (&mail.Address{Name: displayName, Address: parsed.Address}).String())
+				continue
+			}
+		}
+		formatted = append(formatted, encodeHeaderWord(part))
 	}
 	return strings.Join(formatted, ", ")
 }
@@ -550,10 +646,21 @@ func sanitizeHeader(value string) string {
 func sanitizeFilename(value string) string {
 	value = sanitizeHeader(value)
 	value = filepath.Base(strings.ReplaceAll(value, "\\", "/"))
-	if value == "." || value == "/" {
+	if value == "." || value == ".." || value == "/" {
 		return ""
 	}
 	return value
+}
+
+func isInlineAttachment(body string, attachment eas.Attachment) bool {
+	if attachment.IsInline || attachment.Method == 6 {
+		return true
+	}
+	contentID := strings.TrimPrefix(strings.ToLower(normalizeContentID(attachment.ContentID)), "cid:")
+	if contentID == "" {
+		return false
+	}
+	return strings.Contains(strings.ToLower(body), "cid:"+contentID)
 }
 
 func normalizeContentID(value string) string {

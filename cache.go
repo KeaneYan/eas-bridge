@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	mimeCacheVersion  = "v3"
+	mimeCacheVersion  = "v4"
 	mimeCacheMaxBytes = int64(1 << 30)
 	mimeCacheMaxAge   = 30 * 24 * time.Hour
 )
