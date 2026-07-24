@@ -55,7 +55,7 @@ func (b *caldavBackend) ListCalendars(ctx context.Context) ([]caldav.Calendar, e
 	return []caldav.Calendar{{
 		Path:                  caldavCalendarPath,
 		Name:                  "日历",
-		Description:           "imeg-eas 桥接的 EAS 日历",
+		Description:           "eas-bridge 桥接的 EAS 日历",
 		MaxResourceSize:       10 << 20,
 		SupportedComponentSet: []string{ical.CompEvent},
 	}}, nil
@@ -195,12 +195,12 @@ func eventToICal(ev eas.EventItem) *ical.Calendar {
 	}
 	cal := ical.NewCalendar()
 	cal.Props.SetText(ical.PropVersion, "2.0")
-	cal.Props.SetText(ical.PropProductID, "-//imeg-eas//EAS CalDAV Bridge//ZH")
+	cal.Props.SetText(ical.PropProductID, "-//eas-bridge//EAS CalDAV Bridge//ZH")
 
 	e := ical.NewEvent()
 	uid := ev.UID
 	if uid == "" {
-		uid = ev.ServerID + "@imeg-eas"
+		uid = ev.ServerID + "@eas-bridge"
 	}
 	e.Props.SetText(ical.PropUID, clean(uid))
 	e.Props.SetText(ical.PropSummary, clean(ev.Subject))
@@ -383,7 +383,7 @@ func serveCalDAV(engine *syncEngine, addr string) error {
 	authed := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		user, pass, ok := r.BasicAuth()
 		if !ok || user != cfg.User || pass != cfg.Password {
-			w.Header().Set("WWW-Authenticate", `Basic realm="imeg-eas"`)
+			w.Header().Set("WWW-Authenticate", `Basic realm="eas-bridge"`)
 			http.Error(w, "未授权", http.StatusUnauthorized)
 			return
 		}
@@ -395,5 +395,5 @@ func serveCalDAV(engine *syncEngine, addr string) error {
 }
 
 func errCalDAVReadOnly(op string) error {
-	return webdav.NewHTTPError(http.StatusForbidden, fmt.Errorf("%s 暂不支持（imeg-eas 日历为只读桥）", op))
+	return webdav.NewHTTPError(http.StatusForbidden, fmt.Errorf("%s 暂不支持（eas-bridge 日历为只读桥）", op))
 }

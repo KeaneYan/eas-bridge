@@ -20,7 +20,7 @@ type config struct {
 
 func configDir() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "imeg-eas")
+	return filepath.Join(home, ".config", "eas-bridge")
 }
 
 func configPath() string { return filepath.Join(configDir(), "config.json") }
@@ -31,7 +31,7 @@ func loadConfig() (*config, error) {
 	cfg := &config{}
 	b, err := os.ReadFile(configPath())
 	if err != nil {
-		return nil, fmt.Errorf("未找到配置（请先运行: imeg-eas --init）: %w", err)
+		return nil, fmt.Errorf("未找到配置（请先运行: eas-bridge --init）: %w", err)
 	}
 	if err := json.Unmarshal(b, cfg); err != nil {
 		return nil, fmt.Errorf("config.json 损坏: %w", err)
@@ -51,7 +51,7 @@ func loadConfig() (*config, error) {
 	// H4 防护：明文认证服务只应绑回环——非回环地址拒绝启动
 	for _, a := range []string{cfg.IMAPAddr, cfg.SMTPAddr, cfg.CalDAVAddr} {
 		if !isLoopbackAddr(a) {
-			return nil, fmt.Errorf("监听地址 %s 非回环：imeg-eas 使用明文认证，只允许 127.0.0.1/localhost（确需对外请自行加 TLS 后再改）", a)
+			return nil, fmt.Errorf("监听地址 %s 非回环：eas-bridge 使用明文认证，只允许 127.0.0.1/localhost（确需对外请自行加 TLS 后再改）", a)
 		}
 	}
 	if cfg.PollSecs <= 0 {

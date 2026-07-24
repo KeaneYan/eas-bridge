@@ -63,7 +63,7 @@ func newSyncEngine(cfg *config) (*syncEngine, error) {
 		Username:   cfg.User,
 		Password:   cfg.Password,
 		DeviceID:   deviceID,
-		DeviceType: "imeg-eas",
+		DeviceType: "eas-bridge",
 		ASVersion:  asVersion,
 		State:      st,
 	})

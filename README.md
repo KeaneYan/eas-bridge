@@ -1,10 +1,10 @@
-# imeg-eas
+# eas-bridge
 
 EAS（Exchange ActiveSync）→ **IMAP + SMTP + CalDAV** 协议桥。让 Apple Mail / Apple 日历等标准客户端直接连接只支持 EAS 的邮件服务器（如 Coremail 企业邮箱）。
 
 ```
 Apple Mail ──IMAP :1143──┐
-            ──SMTP :1025──┤ imeg-eas ──EAS(HTTPS)──> Coremail/Exchange
+            ──SMTP :1025──┤ eas-bridge ──EAS(HTTPS)──> Coremail/Exchange
 Apple 日历 ─CalDAV :8008──┘
 ```
 
@@ -21,13 +21,13 @@ Apple 日历 ─CalDAV :8008──┘
 ## 快速开始
 
 ```bash
-go build -o imeg-eas .
+go build -o eas-bridge .
 
 # 1. 初始化配置
-./imeg-eas --init
-# 2. 编辑 ~/.config/imeg-eas/config.json 填入 server/user/password
+./eas-bridge --init
+# 2. 编辑 ~/.config/eas-bridge/config.json 填入 server/user/password
 # 3. 启动
-./imeg-eas
+./eas-bridge
 ```
 
 `config.json` 示例：
@@ -72,7 +72,7 @@ go build -o imeg-eas .
 
 ## 与 webank-mail 的关系
 
-姊妹项目 [eas-mail-macos](https://github.com/KeaneYan/eas-mail-macos)（原生 SwiftUI 客户端）共用 `third_party/go-activesync` fork。本项目独立 DeviceID + 独立 state 目录（`~/.config/imeg-eas/`），两者可同时对同一账号同步互不干扰。
+姊妹项目 [eas-mail-macos](https://github.com/KeaneYan/eas-mail-macos)（原生 SwiftUI 客户端）共用 `third_party/go-activesync` fork。本项目独立 DeviceID + 独立 state 目录（`~/.config/eas-bridge/`），两者可同时对同一账号同步互不干扰。
 
 ## 当前限制（v1）
 

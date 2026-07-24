@@ -27,7 +27,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	log.Printf("[imeg-eas] 用户=%s 服务器=%s", cfg.User, cfg.Server)
+	log.Printf("[eas-bridge] 用户=%s 服务器=%s", cfg.User, cfg.Server)
 
 	engine, err := newSyncEngine(cfg)
 	if err != nil {
@@ -94,12 +94,12 @@ func main() {
 		imapd.broadcast(folderID)
 	})
 
-	log.Printf("[imeg-eas] 就绪。IMAP %s  SMTP %s  CalDAV %s（Ctrl+C 退出）", cfg.IMAPAddr, cfg.SMTPAddr, cfg.CalDAVAddr)
+	log.Printf("[eas-bridge] 就绪。IMAP %s  SMTP %s  CalDAV %s（Ctrl+C 退出）", cfg.IMAPAddr, cfg.SMTPAddr, cfg.CalDAVAddr)
 
 	// 等待退出信号
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	fmt.Println()
-	log.Println("[imeg-eas] 正在退出...")
+	log.Println("[eas-bridge] 正在退出...")
 }

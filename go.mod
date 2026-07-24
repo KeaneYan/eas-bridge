@@ -1,4 +1,4 @@
-module imeg-eas
+module eas-bridge
 
 go 1.26.2
 

@@ -494,7 +494,7 @@ func forEachItem(numSet imap.NumSet, snap *mboxSnapshot, fn func(uint32, eas.Ema
 func errNotSupported(op string) error {
 	return &imap.Error{
 		Type: imap.StatusResponseTypeNo,
-		Text: fmt.Sprintf("%s 暂不支持（imeg-eas v1）", op),
+		Text: fmt.Sprintf("%s 暂不支持（eas-bridge v1）", op),
 	}
 }
 
