@@ -210,7 +210,9 @@ func (sess *imapSession) Select(mailbox string, options *imap.SelectOptions) (*i
 	st := sess.d.engine.st
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	items := st.Items[folder.ServerID]
+	// 拷贝切片：markRead/setFlagged 等原地改底层数组，快照共享底层数组
+	// 会造成跨会话污染与 data race（ZCode 全量审查 HIGH-3）
+	items := append([]eas.EmailItem(nil), st.Items[folder.ServerID]...)
 	fm := st.FolderMeta[folder.ServerID]
 
 	// 构建双向 UID 映射快照
@@ -421,6 +423,12 @@ func (sess *imapSession) pushReadChanges(ctx context.Context, readChanges []eas.
 	defer cancel()
 	if _, err := sess.d.engine.c.ApplyEmailChanges(ctx, sess.selected, readChanges); err != nil {
 		log.Printf("[imap] 已读状态回推失败（本地已生效）: %v", err)
+		return
+	}
+	// 上行 Change 推进了 synckey（仅内存），立即落盘主文件——否则窗口内
+	// 重启从旧 key 恢复被判失效触发全量重拉（ZCode 全量审查 HIGH-4）
+	if err := sess.d.engine.st.saveNow(); err != nil {
+		log.Printf("[imap] synckey 落盘失败: %v", err)
 	}
 }
 
@@ -706,7 +714,7 @@ func (sess *imapSession) refreshSnapshot() {
 	st := sess.d.engine.st
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	items := st.Items[sess.selected]
+	items := append([]eas.EmailItem(nil), st.Items[sess.selected]...)
 	fm := st.FolderMeta[sess.selected]
 	uidForSID := map[string]uint32{}
 	sidForUID := map[uint32]string{}

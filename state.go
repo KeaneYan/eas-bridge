@@ -293,16 +293,19 @@ func (s *diskState) mutate(fn func()) error {
 	return s.saveMainLocked()
 }
 
-// mutateFolder 持锁执行 fn 并落盘该文件夹分片 + 主文件
+// mutateFolder 持锁执行 fn 并落盘主文件 + 该文件夹分片
 // （syncMailOnce 同时推进 Items/UIDs（分片）与 FolderMeta/SyncKeys（主文件））。
+// 顺序必须是先主后分（ZCode 全量审查 HIGH-2）：主文件先落，若分片写失败，
+// 后果只是 NextUID 跳号（无害空洞）；反过来分片先落而主文件失败，
+// NextUID 回退而分片里已有高位 UID，重启后 assignUIDs 会重用 UID。
 func (s *diskState) mutateFolder(folderID string, fn func()) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	fn()
-	if err := s.saveFolderLocked(folderID); err != nil {
+	if err := s.saveMainLocked(); err != nil {
 		return err
 	}
-	return s.saveMainLocked()
+	return s.saveFolderLocked(folderID)
 }
 
 // ---------- EAS StateStore 接口实现 ----------
@@ -342,6 +345,14 @@ func (s *diskState) assignUIDs(folderID string, items []eas.EmailItem) []eas.Ema
 	}
 	if meta.NextUID == 0 {
 		meta.NextUID = 1 // IMAP UID 从 1 开始
+	}
+	// 防御：NextUID 不得低于已有最大 UID+1（ZCode 全量审查 HIGH-2——
+	// 主文件比分片旧时 NextUID 回退会重用 UID，UIDVALIDITY 不变下 UID 重复
+	// 是最静默的损坏形态）
+	for _, e := range s.UIDs[folderID] {
+		if e.UID >= meta.NextUID {
+			meta.NextUID = e.UID + 1
+		}
 	}
 	s.FolderMeta[folderID] = meta
 
@@ -543,11 +554,11 @@ func (s *diskState) addMovedItems(dstFolder string, items []eas.EmailItem) error
 	defer s.mu.Unlock()
 	s.Items[dstFolder] = append(s.Items[dstFolder], items...)
 	s.Items[dstFolder] = s.assignUIDs(dstFolder, s.Items[dstFolder])
-	// assignUIDs 推进了 FolderMeta（主文件），两处都要落
-	if err := s.saveFolderLocked(dstFolder); err != nil {
+	// assignUIDs 推进了 FolderMeta（主文件），两处都要落；先主后分（同 HIGH-2）
+	if err := s.saveMainLocked(); err != nil {
 		return err
 	}
-	return s.saveMainLocked()
+	return s.saveFolderLocked(dstFolder)
 }
 
 // resetSyncKey 清除文件夹的 synckey 并立即落盘（下次同步从头引导）。
@@ -578,17 +589,25 @@ func (s *diskState) saveCalendarLocked() error {
 
 // upsertEvent 写入/更新日历事件（CalDAV 写操作后本地落库）。
 // EAS 不回显本设备变更，与 addMovedItems 同理必须自行落库。
+// 主文件也要落：CreateEvent/UpdateEvent 上行会推进日历 synckey（内存），
+// 不落盘则重启从旧 key 恢复被判失效（ZCode 全量审查 HIGH-1）。
 func (s *diskState) upsertEvent(ev eas.EventItem) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Events[ev.ServerID] = ev
-	return s.saveEventsLocked()
+	if err := s.saveEventsLocked(); err != nil {
+		return err
+	}
+	return s.saveMainLocked()
 }
 
-// deleteEvent 删除日历事件（CalDAV DELETE 后本地落库）。
+// deleteEvent 删除日历事件（CalDAV DELETE 后本地落库）。主文件同 upsertEvent。
 func (s *diskState) deleteEvent(serverID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.Events, serverID)
-	return s.saveEventsLocked()
+	if err := s.saveEventsLocked(); err != nil {
+		return err
+	}
+	return s.saveMainLocked()
 }

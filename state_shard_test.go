@@ -177,3 +177,31 @@ func TestEventShardPersistence(t *testing.T) {
 		t.Fatal("事件删除未落盘")
 	}
 }
+
+// TestAssignUIDsClampsNextUID：主文件比分片旧时 NextUID 回退，assignUIDs
+// 必须校正到 maxUID+1，杜绝 UID 重用（ZCode 全量审查 HIGH-2 回归）。
+func TestAssignUIDsClampsNextUID(t *testing.T) {
+	dir := t.TempDir()
+	st, err := loadState(filepath.Join(dir, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.mu.Lock()
+	st.UIDs["1"] = []uidEntry{{ServerID: "old", UID: 5}}
+	st.Items["1"] = []eas.EmailItem{{ServerID: "old"}}
+	st.FolderMeta["1"] = folderMeta{NextUID: 3, UIDValidity: 7} // 回退的 NextUID
+	got := st.assignUIDs("1", append(st.Items["1"], eas.EmailItem{ServerID: "new"}))
+	meta := st.FolderMeta["1"]
+	st.mu.Unlock()
+	if meta.NextUID != 7 {
+		t.Fatalf("NextUID = %d, want 7（max 5 + 新分配 6 + 1）", meta.NextUID)
+	}
+	// 新邮件必须拿到 6，不是回退后的 3
+	for _, it := range got {
+		if it.ServerID == "new" {
+			if st.uidForServerID("1", "new") != 6 {
+				t.Fatalf("新邮件 UID = %d, want 6", st.uidForServerID("1", "new"))
+			}
+		}
+	}
+}
