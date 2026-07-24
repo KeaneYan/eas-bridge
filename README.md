@@ -102,7 +102,7 @@ tail -f ~/Library/Logs/eas-bridge.log      # 看日志
 
 - 删除邮件 = 移到服务器"已删除"文件夹（可恢复）；无永久删除
 - COPY 实为移动（EAS 无服务端复制语义，与 DavMail 一致）；APPEND 不支持
-- SEARCH 只支持 ALL / UNSEEN（SUBJECT 等条件未实现，返回全部；Apple Mail 本地搜索不受影响）
+- SEARCH 支持 SUBJECT/FROM/TO/CC 等头部、日期、尺寸、标志位、NOT/OR 组合；TEXT/BODY 只覆盖已缓存正文（读过的邮件），未缓存的正文不参与匹配（Apple Mail 全文搜索走本地索引，不受影响）；不支持 \Answered/\Draft 标志（服务器无此数据）
 - 已读回推失败时不重试（本地状态保留，下次增量同步收敛）
 - **日历写入被服务器拒绝**：Coremail 对日历文件夹的上行 Sync 命令一律回 Status 5（实测 Add/Change 跨协议版本 12.1/14.0/14.1 均拒绝，邮件上行正常）——代码已完整实现创建/更新/删除，但服务器策略使日历实为只读，写操作会收到 403 及明确提示；若服务器策略变更则自动可用
 
