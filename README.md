@@ -100,16 +100,15 @@ tail -f ~/Library/Logs/eas-bridge.log      # 看日志
 
 ## 当前限制（v1）
 
-- 不支持删除邮件（EXPUNGE/COPY/APPEND 返回 NO）——请在网页端或其他客户端操作
-- SEARCH 只支持 ALL / UNSEEN
-- 已读状态只改本地，不回推服务器
-- 只轮询收件箱
+- 删除邮件 = 移到服务器"已删除"文件夹（可恢复）；无永久删除
+- COPY 实为移动（EAS 无服务端复制语义，与 DavMail 一致）；APPEND 不支持
+- SEARCH 只支持 ALL / UNSEEN（SUBJECT 等条件未实现，返回全部；Apple Mail 本地搜索不受影响）
+- 已读回推失败时不重试（本地状态保留，下次增量同步收敛）
 - **日历只读**（PUT/DELETE 返回 403）；修改型循环例外（Exceptions 非 Deleted）暂忽略
 
 ## Roadmap
 
-- 删除/移动映射到 EAS MoveItems
-- 已读回推（EAS Sync Change）
+- SEARCH 支持 SUBJECT/FROM 等常用条件
 - 日历写操作（EAS CreateEvent/UpdateEvent/DeleteEvent）
 - 循环修改型例外 → RECURRENCE-ID 覆盖事件
 
