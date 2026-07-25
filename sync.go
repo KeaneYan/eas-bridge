@@ -363,12 +363,18 @@ func (e *syncEngine) findFolder(folderID string) (eas.Folder, bool) {
 	return eas.Folder{}, false
 }
 
+// ErrSyncBackoffSkip 日历同步因 Status 5 退避被跳过。
+// 与 syncMail 退避返回 nil 不同（IMAP SELECT/STATUS 会把错误透传给客户端，
+// 退避不该吓客户端），CalDAV 路径在 maybeSyncCalendar 内部消化这个 sentinel——
+// 用它区分"跳过"与"成功"，lastCalSync 只在真成功时推进（ZCode backoff M-2）。
+var ErrSyncBackoffSkip = errors.New("Status 5 退避期，本次日历同步跳过")
+
 // syncCalendar 增量同步日历事件到 st.Events（synckey 由库自动持久化）。
 // Coremail 忽略 FilterType，首次全量拉取后靠 synckey 增量。
 func (e *syncEngine) syncCalendar(ctx context.Context) error {
 	const key = "calendar"
 	if e.skipBackoff(key) {
-		return nil // 退避期：本轮跳过，本地事件缓存照常服务 CalDAV 读
+		return ErrSyncBackoffSkip // 退避期：本地事件缓存照常服务 CalDAV 读
 	}
 	_, err := e.flights.DoContext(ctx, "sync-calendar", func() (any, error) {
 		err := e.syncCalendarOnce(ctx)

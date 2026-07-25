@@ -207,8 +207,10 @@ func TestSyncCalendarSkipsDuringBackoff(t *testing.T) {
 		},
 	}
 	engine.trackSyncResult("calendar", &eas.StatusError{Command: "Sync", Code: 5})
-	if err := engine.syncCalendar(context.Background()); err != nil {
-		t.Fatalf("退避期跳过不应报错: %v", err)
+	// 语义（P3 起）：退避跳过返回 ErrSyncBackoffSkip sentinel，
+	// 供 CalDAV 层区分"跳过"与"成功"（lastCalSync 不推进）
+	if err := engine.syncCalendar(context.Background()); !errors.Is(err, ErrSyncBackoffSkip) {
+		t.Fatalf("退避期应返回 ErrSyncBackoffSkip，实际 %v", err)
 	}
 	if calls != 0 {
 		t.Fatalf("退避期不应发起 SyncCalendar，实际 %d 次", calls)

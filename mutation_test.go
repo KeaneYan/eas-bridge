@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"errors"
+	"net"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/hstern/go-activesync/eas"
@@ -397,5 +399,57 @@ func TestStoreFlaggedLocalAndPush(t *testing.T) {
 	}
 	if !hasFlagged {
 		t.Fatalf("itemFlags 缺 \\Flagged: %+v", flags)
+	}
+}
+
+// 优雅退出：Serve 阻塞中，Shutdown 后 Serve 返回 nil、监听端口释放、
+// 已建立的连接被断开（go-imap Close 语义）。
+func TestIMAPGracefulShutdown(t *testing.T) {
+	d := newIMAPD(&syncEngine{})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close() // 让 Serve 自己监听同一地址
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- d.Serve(addr) }()
+
+	// 等服务起来并建立一个连接
+	var conn net.Conn
+	for i := 0; i < 50; i++ {
+		conn, err = net.DialTimeout("tcp", addr, 100*time.Millisecond)
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if conn == nil {
+		t.Fatalf("连接 %s 失败: %v", addr, err)
+	}
+
+	d.Shutdown()
+
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			t.Fatalf("Shutdown 后 Serve 应返回 nil，实际 %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Shutdown 后 Serve 未退出")
+	}
+	// 连接应被断开。注意 go-imap accept 后立即下发未请求的 IMAP greeting，
+	// 第一次 Read 读到 greeting 返回 (n>0, nil) 是正常的——必须读到出错为止。
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for {
+		if _, err := conn.Read(make([]byte, 64)); err != nil {
+			break // EOF 或超时都算"已断开/不再可写"
+		}
+	}
+	conn.Close()
+	// 端口应已释放
+	if _, err := net.DialTimeout("tcp", addr, 200*time.Millisecond); err == nil {
+		t.Error("Shutdown 后端口仍在监听")
 	}
 }

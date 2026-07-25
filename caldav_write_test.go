@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -380,5 +381,25 @@ END:VCALENDAR`
 	// 纽约 7 月 EDT = UTC-4，14:00 本地 → 18:00 UTC
 	if d.StartTime.Hour() != 18 {
 		t.Fatalf("TZID=New_York 14:00 应转 UTC 18:00, got %v", d.StartTime)
+	}
+}
+
+// 退避 sentinel：syncCalendar 跳过返回 ErrSyncBackoffSkip，lastCalSync 不推进
+func TestCalendarBackoffSkipDoesNotAdvanceLastSync(t *testing.T) {
+	engine := &syncEngine{}
+	engine.trackSyncResult("calendar", &eas.StatusError{Command: "Sync", Code: 5})
+	err := engine.syncCalendar(context.Background())
+	if !errors.Is(err, ErrSyncBackoffSkip) {
+		t.Fatalf("退避期应返回 sentinel，实际 %v", err)
+	}
+
+	b := &caldavBackend{engine: engine}
+	b.finishCalendarSync(err)
+	if !b.lastCalSync.IsZero() {
+		t.Fatal("sentinel 不应推进 lastCalSync")
+	}
+	b.finishCalendarSync(nil)
+	if b.lastCalSync.IsZero() {
+		t.Fatal("成功同步应推进 lastCalSync")
 	}
 }

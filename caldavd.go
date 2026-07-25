@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -144,6 +145,9 @@ func (b *caldavBackend) maybeSyncCalendar(ctx context.Context) error {
 	}
 	err := b.engine.syncCalendar(ctx)
 	b.finishCalendarSync(err)
+	if errors.Is(err, ErrSyncBackoffSkip) {
+		return nil // 退避跳过不是故障，lastCalSync 不推进（下轮查询会再试）
+	}
 	return err
 }
 
@@ -396,8 +400,8 @@ func easRecurrenceToRRULE(r *eas.Recurrence) string {
 
 // ---------- HTTP 服务 ----------
 
-// serveCalDAV 启动 CalDAV 监听（Basic Auth + 阻塞）。
-func serveCalDAV(engine *syncEngine, addr string) error {
+// newCalDAVServer 构建 CalDAV HTTP 服务（Basic Auth），由 main 启动/优雅关闭。
+func newCalDAVServer(engine *syncEngine, addr string) *http.Server {
 	backend := &caldavBackend{engine: engine}
 	handler := &caldav.Handler{Backend: backend}
 
@@ -413,7 +417,7 @@ func serveCalDAV(engine *syncEngine, addr string) error {
 	})
 
 	log.Printf("[caldav] 监听 %s", addr)
-	return http.ListenAndServe(addr, authed)
+	return &http.Server{Addr: addr, Handler: authed}
 }
 
 func errCalDAVReadOnly(op string) error {

@@ -99,7 +99,7 @@ func (s *smtpSession) Data(r io.Reader) error {
 }
 
 // ServeSMTP 启动 SMTP 监听（阻塞）。
-func serveSMTP(engine *syncEngine, addr string) error {
+func newSMTPServer(engine *syncEngine, addr string) *smtp.Server {
 	be := &smtpBackend{engine: engine}
 	s := smtp.NewServer(be)
 	s.Addr = addr
@@ -107,6 +107,5 @@ func serveSMTP(engine *syncEngine, addr string) error {
 	s.AllowInsecureAuth = true // 仅 localhost 监听
 	s.MaxMessageBytes = 50 << 20
 	s.MaxRecipients = 100
-	log.Printf("[smtpd] 监听 %s", addr)
-	return s.ListenAndServe()
+	return s
 }

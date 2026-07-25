@@ -2,13 +2,17 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	smtp "github.com/emersion/go-smtp"
 )
 
 func main() {
@@ -45,30 +49,35 @@ func main() {
 	folders := engine.mailFolderIDs()
 
 	// 启动 IMAP 服务
-	imapd := newIMAPD(engine)
+	imapD := newIMAPD(engine)
 	go func() {
-		if err := imapd.Serve(cfg.IMAPAddr); err != nil {
+		// Serve 正常被 Shutdown 时返回 nil；若信号抢在监听建立前到达会
+		// 返回 go-imap 未导出的 errClosed——用 ShuttingDown 兜底区分
+		if err := imapD.Serve(cfg.IMAPAddr); err != nil && !imapD.ShuttingDown() {
 			log.Fatal("[imapd] ", err)
 		}
 	}()
 
 	// 启动 SMTP 服务
+	smtpSrv := newSMTPServer(engine, cfg.SMTPAddr)
 	go func() {
-		if err := serveSMTP(engine, cfg.SMTPAddr); err != nil {
+		log.Printf("[smtpd] 监听 %s", cfg.SMTPAddr)
+		if err := smtpSrv.ListenAndServe(); err != nil && !errors.Is(err, smtp.ErrServerClosed) {
 			log.Fatal("[smtpd] ", err)
 		}
 	}()
 
 	// 启动 CalDAV 服务
+	calSrv := newCalDAVServer(engine, cfg.CalDAVAddr)
 	go func() {
-		if err := serveCalDAV(engine, cfg.CalDAVAddr); err != nil {
+		if err := calSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal("[caldav] ", err)
 		}
 	}()
 
 	// 启动轮询（变更时 fan-out 广播给所有 IDLE 会话）
 	go engine.poller(ctx, time.Duration(cfg.PollSecs)*time.Second, func(folderID string) {
-		imapd.broadcast(folderID)
+		imapD.broadcast(folderID)
 	})
 
 	log.Printf("[eas-bridge] 就绪。IMAP %s  SMTP %s  CalDAV %s（Ctrl+C 退出）", cfg.IMAPAddr, cfg.SMTPAddr, cfg.CalDAVAddr)
@@ -98,4 +107,18 @@ func main() {
 	<-sig
 	fmt.Println()
 	log.Println("[eas-bridge] 正在退出...")
+
+	// 优雅退出（full-review ROI-7）：先停后台同步，再关三个服务。
+	// SMTP/CalDAV 渐进退出（等在途请求，最多 10s）；go-imap 无渐进语义只能直接断。
+	cancel()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+	if err := calSrv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("[caldav] 优雅关闭失败: %v", err)
+	}
+	if err := smtpSrv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("[smtpd] 优雅关闭失败: %v", err)
+	}
+	imapD.Shutdown()
+	log.Println("[eas-bridge] 已退出")
 }

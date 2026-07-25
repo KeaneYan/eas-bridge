@@ -21,6 +21,10 @@ type imapd struct {
 	engine *syncEngine
 	subsMu sync.Mutex
 	subs   map[chan string]struct{} // IDLE 会话订阅表（fan-out 广播）
+
+	srvMu        sync.Mutex
+	srv          *imapserver.Server // Serve 启动后赋值，供 Shutdown 关闭
+	shuttingDown bool               // Shutdown 已发起：Serve 因此返回的错误不算故障
 }
 
 func newIMAPD(engine *syncEngine) *imapd {
@@ -52,7 +56,7 @@ func (d *imapd) broadcast(folderID string) {
 	}
 }
 
-// Serve 启动 IMAP 监听（阻塞）。
+// Serve 启动 IMAP 监听（阻塞；Shutdown 后返回 nil）。
 func (d *imapd) Serve(addr string) error {
 	srv := imapserver.New(&imapserver.Options{
 		NewSession: func(conn *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
@@ -61,12 +65,37 @@ func (d *imapd) Serve(addr string) error {
 		},
 		InsecureAuth: true, // 仅 localhost 监听，无需 TLS
 	})
+	d.srvMu.Lock()
+	d.srv = srv
+	d.srvMu.Unlock()
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
 	log.Printf("[imapd] 监听 %s", addr)
 	return srv.Serve(ln)
+}
+
+// Shutdown 立即停止监听并断开所有会话（go-imap 无渐进退出语义）。
+func (d *imapd) Shutdown() {
+	d.srvMu.Lock()
+	defer d.srvMu.Unlock()
+	d.shuttingDown = true
+	if d.srv != nil {
+		if err := d.srv.Close(); err != nil {
+			log.Printf("[imapd] 关闭失败: %v", err)
+		}
+	}
+}
+
+// ShuttingDown 报告 Shutdown 是否已发起。
+// main 用它区分"被 Shutdown 的正常退出"与真故障：若信号在 Serve 建立监听
+// 前到达，Close 会把 srv 标记 closed，随后 Serve 返回未导出的 errClosed
+// （非 net.ErrClosed），没这个标志会被 log.Fatal 误判成启动失败。
+func (d *imapd) ShuttingDown() bool {
+	d.srvMu.Lock()
+	defer d.srvMu.Unlock()
+	return d.shuttingDown
 }
 
 // ---------- IMAP Session ----------
