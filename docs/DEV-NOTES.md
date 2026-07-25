@@ -68,6 +68,7 @@ fork 保持上游语义不解码（FORK-NOTES）。eas-bridge 曾直接用 `got.
 ### Status 5 风暴必须退避，不能每分钟全量重拉（2026-07-25 凌晨 6 小时事故）
 Coremail 对失效 synckey 回 Status 5；但**服务器整体故障时全文件夹都回 5**。此时"清 key + 全量重拉"每轮询周期一次 = 每分钟对每个文件夹全拉 6 个月邮件，打服务器+毁本地状态。`syncEngine.backoff`（纯内存）：成功清零、Status 5 按 1m→5m→15m→30m 升档、退避期 `skipBackoff` 短路返回 nil（本地 state 照常服务 IMAP/CalDAV 读）。
 **两条并发纪律**：`trackSyncResult` 必须放 singleflight fn **内**（flight 合并后每个调用者都会拿到同一 err，放外面会重复升档，ZCode H-1）；poller 退避期**不得 onChange 广播**（无新数据却刷醒客户端）。
+**后续（2026-07-25 P3）**：日历退避跳过改返回 `ErrSyncBackoffSkip` sentinel（maybeSyncCalendar 内部消化，lastCalSync 只在真成功推进）；syncMail 仍返回 nil（IMAP 会把错误透传客户端）。优雅退出：main 信号后 cancel→CalDAV/SMTP 渐进 Shutdown(10s)→IMAP Close；`imapd.shuttingDown` 标志区分"信号抢先于监听"时 go-imap 未导出 errClosed 与真故障，防 log.Fatal 误判。
 
 ## 三、架构不变量
 
