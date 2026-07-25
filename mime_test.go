@@ -87,42 +87,6 @@ func (*bodyScenarioClient) FetchAttachment(context.Context, string, int64, int64
 	return nil, nil
 }
 
-func TestFetchAndBuildMIMEFallsBackToHTMLAndAttachments(t *testing.T) {
-	client := &fakeMessageContentClient{}
-	got, complete := fetchAndBuildMIME(context.Background(), client, "inbox", "message-1", eas.EmailItem{
-		ServerID: "message-1",
-		From:     "发件人 <sender@example.com>",
-		To:       "receiver@example.com",
-	})
-	if !complete {
-		t.Fatal("complete = false, want true")
-	}
-	if want := []eas.BodyType{eas.BodyTypeMIME, eas.BodyTypeHTML, eas.BodyTypePlain}; !equalBodyTypes(client.fetches, want) {
-		t.Fatalf("FetchEmail body types = %v, want %v", client.fetches, want)
-	}
-	if got, want := strings.Join(client.attachments, ","), "inline-ref,file-ref"; got != want {
-		t.Fatalf("FetchAttachment refs = %q, want %q", got, want)
-	}
-
-	msg, err := mail.ReadMessage(bytes.NewReader(got))
-	if err != nil {
-		t.Fatalf("ReadMessage: %v", err)
-	}
-	decodedSubject, err := new(mime.WordDecoder).DecodeHeader(msg.Header.Get("Subject"))
-	if err != nil {
-		t.Fatalf("DecodeHeader: %v", err)
-	}
-	if decodedSubject != "格式化邮件" {
-		t.Fatalf("Subject = %q", decodedSubject)
-	}
-
-	leaves := collectLeaves(t, textproto.MIMEHeader(msg.Header), msg.Body)
-	assertLeaf(t, leaves, "text/plain", "", "", []byte("标题"))
-	assertLeaf(t, leaves, "text/html", "", "", []byte(`<html><body><h1>标题</h1><img src="cid:logo"></body></html>`))
-	assertLeaf(t, leaves, "image/png", "inline", "logo.png", []byte("data:inline-ref"))
-	assertLeaf(t, leaves, "application/pdf", "attachment", "报告.pdf", []byte("data:file-ref"))
-}
-
 func TestConstructRFC822PlainText(t *testing.T) {
 	got := constructRFC822(eas.EmailItem{
 		ServerID:     "plain-1",
@@ -377,28 +341,6 @@ func (c *base64AttachmentClient) FetchAttachment(_ context.Context, fileReferenc
 	return &eas.FetchAttachmentResult{
 		Data: []byte(base64.StdEncoding.EncodeToString(c.payload)),
 	}, nil
-}
-
-// 回归：fork 库 FetchAttachment 返回未解码 base64 原文，构建 MIME 时必须解码，
-// 否则写出双层 base64，客户端解一层后拿到文本而非图片（2026-07-25 图片全挂事故）。
-func TestFetchAndBuildMIMEDecodesBase64Attachment(t *testing.T) {
-	payload := bytes.Repeat([]byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}, 3) // PNG magic x3，base64 >=16 字符
-	client := &base64AttachmentClient{payload: payload}
-	got, complete := fetchAndBuildMIME(context.Background(), client, "inbox", "message-1", eas.EmailItem{
-		ServerID: "message-1",
-		From:     "sender@example.com",
-		To:       "receiver@example.com",
-	})
-	if !complete {
-		t.Fatal("complete = false, want true")
-	}
-	msg, err := mail.ReadMessage(bytes.NewReader(got))
-	if err != nil {
-		t.Fatalf("ReadMessage: %v", err)
-	}
-	leaves := collectLeaves(t, textproto.MIMEHeader(msg.Header), msg.Body)
-	assertLeaf(t, leaves, "image/png", "inline", "logo.png", payload)
-	assertLeaf(t, leaves, "application/pdf", "attachment", "报告.pdf", payload)
 }
 
 // 显示名含字面分号时不得切开/篡改（EAS 用 ; 分隔地址，引号内的 ; 属于名字）。

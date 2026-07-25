@@ -328,7 +328,7 @@ func (e *syncEngine) downloadAttachment(ctx context.Context, meta eas.Attachment
 		if len(result.Data) == 0 {
 			return nil, fmt.Errorf("附件分块 %d-%d 返回空数据", start, end)
 		}
-		chunk, err := decodeBase64Chunk(result.Data)
+		chunk, _, err := decodeBase64Chunk(result.Data)
 		if err != nil {
 			return nil, fmt.Errorf("附件分块 %d-%d base64 解码失败: %w", start, end, err)
 		}

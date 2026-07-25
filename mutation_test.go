@@ -92,15 +92,15 @@ func TestStoreDeletedMarksAndClears(t *testing.T) {
 func TestApplyFlagMutationsSeenAndDeleted(t *testing.T) {
 	engine := newMutationTestEngine(t, &easmock.Client{})
 	sess := newMutationSession(engine)
-	readChanges, mutated, err := sess.applyFlagMutations(uidSetOf(1, 2), &imap.StoreFlags{
+	emailChanges, mutated, err := sess.applyFlagMutations(uidSetOf(1, 2), &imap.StoreFlags{
 		Op:    imap.StoreFlagsAdd,
 		Flags: []imap.Flag{"\\Seen", "\\Deleted"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(readChanges) != 2 || *readChanges[0].Read != true || *readChanges[1].Read != true {
-		t.Fatalf("readChanges = %+v", readChanges)
+	if len(emailChanges) != 2 || *emailChanges[0].Read != true || *emailChanges[1].Read != true {
+		t.Fatalf("emailChanges = %+v", emailChanges)
 	}
 	if len(mutated) != 2 {
 		t.Fatalf("mutated = %+v", mutated)
@@ -145,14 +145,14 @@ func TestPushReadChangesBatchesAndToleratesFailure(t *testing.T) {
 	changes := []eas.EmailChange{{ServerID: "m1", Read: boolPtr(true)}}
 
 	// 失败：只记日志不 panic、不重试
-	sess.pushReadChanges(context.Background(), changes)
+	sess.pushEmailChanges(context.Background(), changes)
 	// 成功：批量一次调用
-	sess.pushReadChanges(context.Background(), changes)
+	sess.pushEmailChanges(context.Background(), changes)
 	if calls != 2 || len(got) != 1 || got[0].ServerID != "m1" {
 		t.Fatalf("calls=%d got=%+v", calls, got)
 	}
 	// 空变更不调用服务器
-	sess.pushReadChanges(context.Background(), nil)
+	sess.pushEmailChanges(context.Background(), nil)
 	if calls != 2 {
 		t.Fatalf("empty changes should not call server, calls=%d", calls)
 	}
@@ -342,15 +342,15 @@ func TestStoreFlaggedLocalAndPush(t *testing.T) {
 	engine := newMutationTestEngine(t, &easmock.Client{})
 	sess := newMutationSession(engine)
 
-	readChanges, mutated, err := sess.applyFlagMutations(uidSetOf(1), &imap.StoreFlags{
+	emailChanges, mutated, err := sess.applyFlagMutations(uidSetOf(1), &imap.StoreFlags{
 		Op:    imap.StoreFlagsAdd,
 		Flags: []imap.Flag{"\\Flagged"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(readChanges) != 1 || readChanges[0].SetFlagStatus == nil || *readChanges[0].SetFlagStatus != 2 {
-		t.Fatalf("SetFlagStatus 上行缺失: %+v", readChanges)
+	if len(emailChanges) != 1 || emailChanges[0].SetFlagStatus == nil || *emailChanges[0].SetFlagStatus != 2 {
+		t.Fatalf("SetFlagStatus 上行缺失: %+v", emailChanges)
 	}
 	// 本地 state 已落
 	st := engine.st
@@ -372,15 +372,15 @@ func TestStoreFlaggedLocalAndPush(t *testing.T) {
 	}
 
 	// 去星
-	readChanges, mutated, err = sess.applyFlagMutations(uidSetOf(1), &imap.StoreFlags{
+	emailChanges, mutated, err = sess.applyFlagMutations(uidSetOf(1), &imap.StoreFlags{
 		Op:    imap.StoreFlagsDel,
 		Flags: []imap.Flag{"\\Flagged"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(readChanges) != 1 || *readChanges[0].SetFlagStatus != 0 {
-		t.Fatalf("去星上行缺失: %+v", readChanges)
+	if len(emailChanges) != 1 || *emailChanges[0].SetFlagStatus != 0 {
+		t.Fatalf("去星上行缺失: %+v", emailChanges)
 	}
 	st.mu.Lock()
 	got = st.Items["inbox"][0].FlagStatus

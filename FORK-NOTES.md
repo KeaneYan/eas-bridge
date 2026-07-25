@@ -22,5 +22,5 @@
 # 导致 FetchAttachment 无法使用、EAS 级附件（含 cid: 内嵌图）完全不可达。
 #
 # 注意: FetchAttachment 返回的 Data 库层不做 base64 解码（保持上游语义与
-# 其测试约定），解码在本项目 attachments.go decodeAttachmentData 做
-# （尺寸引导判据）。上游测试在改动后保持全绿: go test ./eas/
+# 其测试约定），解码在本项目 mime.go decodeAttachmentData 做
+# （尺寸引导判据；分块路径用同文件 decodeBase64Chunk 逐块严格解码）。上游测试在改动后保持全绿: go test ./eas/

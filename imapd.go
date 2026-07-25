@@ -375,7 +375,7 @@ func flagsFrom(read, deleted, flagged bool) []imap.Flag {
 func (sess *imapSession) applyFlagMutations(numSet imap.NumSet, storeFlags *imap.StoreFlags) ([]eas.EmailChange, []flagMutation, error) {
 	snap := sess.snap
 	st := sess.d.engine.st
-	var readChanges []eas.EmailChange
+	var emailChanges []eas.EmailChange
 	var mutated []flagMutation
 	err := forEachItem(numSet, snap, func(seqNum uint32, item eas.EmailItem) error {
 		serverID := item.ServerID
@@ -391,13 +391,13 @@ func (sess *imapSession) applyFlagMutations(numSet imap.NumSet, storeFlags *imap
 						return err
 					}
 					read = true
-					readChanges = append(readChanges, eas.EmailChange{ServerID: serverID, Read: boolPtr(true)})
+					emailChanges = append(emailChanges, eas.EmailChange{ServerID: serverID, Read: boolPtr(true)})
 				case imap.StoreFlagsDel:
 					if err := st.markUnread(sess.selected, serverID); err != nil {
 						return err
 					}
 					read = false
-					readChanges = append(readChanges, eas.EmailChange{ServerID: serverID, Read: boolPtr(false)})
+					emailChanges = append(emailChanges, eas.EmailChange{ServerID: serverID, Read: boolPtr(false)})
 				}
 			case "\\Flagged":
 				switch storeFlags.Op {
@@ -406,13 +406,13 @@ func (sess *imapSession) applyFlagMutations(numSet imap.NumSet, storeFlags *imap
 						return err
 					}
 					flagged = true
-					readChanges = append(readChanges, eas.EmailChange{ServerID: serverID, SetFlagStatus: intPtr(2)})
+					emailChanges = append(emailChanges, eas.EmailChange{ServerID: serverID, SetFlagStatus: intPtr(2)})
 				case imap.StoreFlagsDel:
 					if err := st.setFlagged(sess.selected, serverID, false); err != nil {
 						return err
 					}
 					flagged = false
-					readChanges = append(readChanges, eas.EmailChange{ServerID: serverID, SetFlagStatus: intPtr(0)})
+					emailChanges = append(emailChanges, eas.EmailChange{ServerID: serverID, SetFlagStatus: intPtr(0)})
 				}
 			case "\\Deleted":
 				switch storeFlags.Op {
@@ -437,20 +437,20 @@ func (sess *imapSession) applyFlagMutations(numSet imap.NumSet, storeFlags *imap
 		})
 		return nil
 	})
-	return readChanges, mutated, err
+	return emailChanges, mutated, err
 }
 
 func intPtr(v int) *int { return &v }
 
-// pushReadChanges 批量回推已读状态到服务器。失败只记日志——本地状态已生效，
+// pushEmailChanges 批量回推已读状态到服务器。失败只记日志——本地状态已生效，
 // 若服务器随后以未读覆盖，下次增量同步会自然收敛。
-func (sess *imapSession) pushReadChanges(ctx context.Context, readChanges []eas.EmailChange) {
-	if len(readChanges) == 0 {
+func (sess *imapSession) pushEmailChanges(ctx context.Context, emailChanges []eas.EmailChange) {
+	if len(emailChanges) == 0 {
 		return
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	if _, err := sess.d.engine.c.ApplyEmailChanges(ctx, sess.selected, readChanges); err != nil {
+	if _, err := sess.d.engine.c.ApplyEmailChanges(ctx, sess.selected, emailChanges); err != nil {
 		log.Printf("[imap] 已读状态回推失败（本地已生效）: %v", err)
 		return
 	}
@@ -465,7 +465,7 @@ func (sess *imapSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, st
 	if sess.snap == nil {
 		return fmt.Errorf("未选中文件夹")
 	}
-	readChanges, mutated, err := sess.applyFlagMutations(numSet, storeFlags)
+	emailChanges, mutated, err := sess.applyFlagMutations(numSet, storeFlags)
 	if err != nil {
 		return err
 	}
@@ -479,7 +479,7 @@ func (sess *imapSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, st
 		}
 	}
 
-	sess.pushReadChanges(sess.ctx, readChanges)
+	sess.pushEmailChanges(sess.ctx, emailChanges)
 	return nil
 }
 

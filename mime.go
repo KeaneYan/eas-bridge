@@ -126,44 +126,6 @@ func fetchMessageSource(ctx context.Context, c messageContentClient, folderID, s
 	}, nil
 }
 
-func fetchAndBuildMIME(ctx context.Context, c messageContentClient, folderID, serverID string, summary eas.EmailItem) ([]byte, bool) {
-	source, err := fetchMessageSource(ctx, c, folderID, serverID, summary)
-	if err != nil {
-		return nil, false
-	}
-	if len(source.RawMIME) > 0 {
-		return source.RawMIME, true
-	}
-
-	attachments := make([]mailAttachment, 0, len(source.Item.Attachments))
-	complete := source.Complete
-	for i, meta := range source.Item.Attachments {
-		if meta.FileReference == "" {
-			complete = false
-			log.Printf("[mime] 第 %d 个附件缺少 FileReference，已跳过", i+1)
-			continue
-		}
-		got, fetchErr := c.FetchAttachment(ctx, meta.FileReference, 0, 0)
-		if fetchErr != nil {
-			complete = false
-			log.Printf("[mime] 第 %d 个附件下载失败，将在下次读取时重试: %v", i+1, fetchErr)
-			continue
-		}
-		attachments = append(attachments, mailAttachment{
-			meta:        meta,
-			data:        decodeAttachmentData(got.Data, meta.EstimatedDataSize),
-			contentType: firstNonEmpty(meta.ContentType, got.ContentType),
-			index:       i,
-		})
-	}
-	if source.Item.HasAttachments && len(source.Item.Attachments) == 0 {
-		complete = false
-		log.Printf("[mime] 邮件声明有附件但服务器未返回附件元数据，将在下次读取时重试")
-	}
-
-	return constructRFC822Message(source.Item, source.PlainBody, serverID, attachments), complete
-}
-
 func validRFC822(raw []byte) bool {
 	if len(raw) <= 10 {
 		return false
@@ -174,19 +136,19 @@ func validRFC822(raw []byte) bool {
 
 // decodeBase64Chunk 严格解码一段 base64（去空白）。用于附件分块等"确定是
 // base64"的场景——分块路径不存在"其实是原文"的歧义，故不做短输入保护。
-func decodeBase64Chunk(raw []byte) ([]byte, error) {
+func decodeBase64Chunk(raw []byte) (dec []byte, compactLen int, err error) {
 	compact := make([]byte, 0, len(raw))
 	for _, b := range raw {
 		if b != '\r' && b != '\n' && b != ' ' && b != '	' {
 			compact = append(compact, b)
 		}
 	}
-	dec := make([]byte, base64.StdEncoding.DecodedLen(len(compact)))
+	dec = make([]byte, base64.StdEncoding.DecodedLen(len(compact)))
 	n, err := base64.StdEncoding.Decode(dec, compact)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return dec[:n], nil
+	return dec[:n], len(compact), nil
 }
 
 // decodeAttachmentData 解码 FetchAttachment 返回的附件数据。
@@ -195,17 +157,11 @@ func decodeBase64Chunk(raw []byte) ([]byte, error) {
 //  1. 声明大小 EstimatedDataSize：解码后长度==声明大小 → 是 base64；原文长度==声明大小 → 是文本
 //  2. 无声明大小时：合法 canonical base64 且长度>=16 才解码（短输入按文本处理防误判）
 func decodeAttachmentData(raw []byte, declaredSize int64) []byte {
-	dec, err := decodeBase64Chunk(raw)
+	dec, compactLen, err := decodeBase64Chunk(raw)
 	if err != nil {
 		return raw // 不是合法 base64，按原文
 	}
 	n := len(dec)
-	compactLen := 0
-	for _, b := range raw {
-		if b != '\r' && b != '\n' && b != ' ' && b != '	' {
-			compactLen++
-		}
-	}
 	if declaredSize > 0 {
 		if int64(n) == declaredSize {
 			return dec
