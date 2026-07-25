@@ -205,3 +205,133 @@ func TestAssignUIDsClampsNextUID(t *testing.T) {
 		}
 	}
 }
+
+// events.jsonl：upsert/delete 追加 → 不写快照 → 重放还原
+func TestEventLogAppendAndReplay(t *testing.T) {
+	dir := t.TempDir()
+	st, err := loadState(filepath.Join(dir, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.upsertEvent(eas.EventItem{ServerID: "ev1", Subject: "会议1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.upsertEvent(eas.EventItem{ServerID: "ev2", Subject: "会议2"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.deleteEvent("ev1"); err != nil {
+		t.Fatal(err)
+	}
+	// 追加路径不写 events.json 快照
+	if _, err := os.Stat(filepath.Join(dir, "events.json")); !os.IsNotExist(err) {
+		t.Fatalf("追加路径不应写 events.json: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "events.jsonl")); err != nil {
+		t.Fatalf("events.jsonl 不存在: %v", err)
+	}
+
+	st2, err := loadState(filepath.Join(dir, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st2.Events["ev1"]; ok {
+		t.Fatal("ev1 应已删除")
+	}
+	if ev, ok := st2.Events["ev2"]; !ok || ev.Subject != "会议2" {
+		t.Fatalf("ev2 重放失败: %v %v", ok, ev.Subject)
+	}
+}
+
+// 崩溃截断的尾行被跳过，不污染已有数据
+func TestEventLogToleratesTruncatedTail(t *testing.T) {
+	dir := t.TempDir()
+	st, err := loadState(filepath.Join(dir, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.upsertEvent(eas.EventItem{ServerID: "ev1", Subject: "完好"}); err != nil {
+		t.Fatal(err)
+	}
+	// 模拟崩溃写一半的尾行
+	f, err := os.OpenFile(filepath.Join(dir, "events.jsonl"), os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"upsert":{"ServerID":"ev-broken","Subject":"残缺`); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	st2, err := loadState(filepath.Join(dir, "state.json"))
+	if err != nil {
+		t.Fatalf("坏尾行不应导致加载失败: %v", err)
+	}
+	if _, ok := st2.Events["ev-broken"]; ok {
+		t.Fatal("截断行不应生效")
+	}
+	if st2.Events["ev1"].Subject != "完好" {
+		t.Fatal("已有事件被污染")
+	}
+}
+
+// 超阈值启动压实：快照重写 + 日志截断 + 数据不丢
+func TestEventLogCompaction(t *testing.T) {
+	old := eventLogCompactThreshold
+	eventLogCompactThreshold = 1 // 1 字节，任何日志都触发压实
+	defer func() { eventLogCompactThreshold = old }()
+
+	dir := t.TempDir()
+	st, err := loadState(filepath.Join(dir, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.upsertEvent(eas.EventItem{ServerID: "ev1", Subject: "压实前"}); err != nil {
+		t.Fatal(err)
+	}
+
+	st2, err := loadState(filepath.Join(dir, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st2.Events["ev1"].Subject != "压实前" {
+		t.Fatal("压实后事件丢失")
+	}
+	fi, err := os.Stat(filepath.Join(dir, "events.jsonl"))
+	if err != nil {
+		t.Fatalf("压实后 events.jsonl 应存在（空文件）: %v", err)
+	}
+	if fi.Size() != 0 {
+		t.Fatalf("压实后日志应截断为 0，实际 %d", fi.Size())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "events.json")); err != nil {
+		t.Fatalf("压实后快照应存在: %v", err)
+	}
+}
+
+// 快照+旧日志并存时重放幂等（压实中崩溃窗口：日志内容已在快照里）
+func TestEventLogReplayIdempotentWithSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	st, err := loadState(filepath.Join(dir, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.upsertEvent(eas.EventItem{ServerID: "ev1", Subject: "v1"}); err != nil {
+		t.Fatal(err)
+	}
+	// 手动写快照（不截断日志，模拟压实中途崩溃）
+	st.mu.Lock()
+	st.Events["ev1"] = eas.EventItem{ServerID: "ev1", Subject: "v1"}
+	b, _ := json.Marshal(eventsShard{Events: st.Events})
+	if err := atomicWriteFile(filepath.Join(dir, "events.json"), b, 0600); err != nil {
+		t.Fatal(err)
+	}
+	st.mu.Unlock()
+
+	st2, err := loadState(filepath.Join(dir, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st2.Events) != 1 || st2.Events["ev1"].Subject != "v1" {
+		t.Fatalf("快照+日志重放结果错误: %v", st2.Events)
+	}
+}

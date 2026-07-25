@@ -227,3 +227,52 @@ func TestSyncBackoffCapsAtMaxStep(t *testing.T) {
 		t.Fatalf("第 50 次失败后退避应为 30m 封顶档，实际 %v", d)
 	}
 }
+
+// poller 并发：文件夹 A 的同步等 B 启动后才返回——串行实现必然超时失败。
+func TestPollerSyncsFoldersConcurrently(t *testing.T) {
+	st := mustLoadTestState(t)
+	st.Folders = []eas.Folder{
+		{ServerID: "a", Type: eas.FolderTypeInbox},
+		{ServerID: "b", Type: eas.FolderTypeUserMail},
+	}
+	startedB := make(chan struct{})
+	var once sync.Once
+	engine := &syncEngine{
+		st: st,
+		c: &easmock.Client{
+			EmailClient: easmock.EmailClient{
+				SyncEmailFunc: func(_ context.Context, fid string, _ eas.EmailSyncOptions) (*eas.EmailSyncResult, error) {
+					switch fid {
+					case "a":
+						select {
+						case <-startedB:
+						case <-time.After(2 * time.Second):
+							return nil, errors.New("B 未在 A 期间启动——poller 是串行的")
+						}
+					case "b":
+						once.Do(func() { close(startedB) })
+					}
+					return &eas.EmailSyncResult{}, nil
+				},
+			},
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		engine.poller(ctx, 20*time.Millisecond, func(string) {})
+		close(done)
+	}()
+	select {
+	case <-startedB:
+	case <-time.After(3 * time.Second):
+		t.Fatal("3s 内 B 未启动")
+	}
+	time.Sleep(150 * time.Millisecond) // 让这一轮完整跑完
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("poller 未在 cancel 后退出")
+	}
+}

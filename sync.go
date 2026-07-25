@@ -404,6 +404,8 @@ func (e *syncEngine) syncCalendarOnce(ctx context.Context) error {
 		return fmt.Errorf("服务器没有日历文件夹")
 	}
 	retried := false
+	var pendingUpserts []eas.EventItem
+	var pendingDeletes []string
 	for page := 0; page < 100; page++ {
 		res, err := e.c.SyncCalendar(ctx, calFolderID, eas.CalendarSyncOptions{WindowSize: 100})
 		if err != nil {
@@ -414,6 +416,8 @@ func (e *syncEngine) syncCalendarOnce(ctx context.Context) error {
 					log.Printf("[sync] 重置日历 synckey 失败: %v", rerr)
 				}
 				retried = true
+				// 清掉重置前累积的批次，避免与全量重拉重复追加（幂等无害但冗余）
+				pendingUpserts, pendingDeletes = nil, nil
 				page = -1
 				continue
 			}
@@ -422,17 +426,23 @@ func (e *syncEngine) syncCalendarOnce(ctx context.Context) error {
 		e.st.mu.Lock()
 		for _, ev := range res.Added {
 			e.st.Events[ev.ServerID] = ev
+			pendingUpserts = append(pendingUpserts, ev)
 		}
 		for _, ev := range res.Changed {
 			e.st.Events[ev.ServerID] = ev
+			pendingUpserts = append(pendingUpserts, ev)
 		}
 		for _, id := range res.Deleted {
 			delete(e.st.Events, id)
+			pendingDeletes = append(pendingDeletes, id)
 		}
 		shouldSave := (page+1)%10 == 0 || !res.MoreAvailable || page == 99
 		var saveErr error
 		if shouldSave {
-			saveErr = e.st.saveCalendarLocked()
+			// 事件变更按批次追加 events.jsonl（与 synckey 落盘同节奏：
+			// 崩溃丢的是未落盘批次的变更，而 key 也未推进，重拉自然补回）
+			saveErr = e.st.saveCalendarLocked(pendingUpserts, pendingDeletes)
+			pendingUpserts, pendingDeletes = nil, nil
 		}
 		e.st.mu.Unlock()
 		if saveErr != nil {
@@ -468,19 +478,28 @@ func (e *syncEngine) poller(ctx context.Context, interval time.Duration, onChang
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// 各文件夹并发同步（full-review ROI-5）：串行时大文件夹拖慢其他
+			// 文件夹时效。syncMail 内部按文件夹 singleflight，并发安全；
+			// SELECT/STATUS 路径本就会与轮询并发打同一服务器。
+			var wg sync.WaitGroup
 			for _, fid := range e.mailFolderIDs() {
 				if e.skipBackoff("mail:" + fid) {
 					continue // 退避期跳过：不同步也不广播（本地无新数据可通知）
 				}
-				if err := e.syncMail(ctx, fid); err != nil {
-					// 单文件夹失败不影响其他文件夹；临时网络错误静默，持续错误记日志但不崩溃
-					if !errors.Is(err, context.Canceled) {
-						log.Printf("[poll] syncMail %s: %v", fid, err)
+				wg.Add(1)
+				go func(fid string) {
+					defer wg.Done()
+					if err := e.syncMail(ctx, fid); err != nil {
+						// 单文件夹失败不影响其他文件夹；临时网络错误静默，持续错误记日志但不崩溃
+						if !errors.Is(err, context.Canceled) {
+							log.Printf("[poll] syncMail %s: %v", fid, err)
+						}
+						return
 					}
-					continue
-				}
-				onChange(fid)
+					onChange(fid)
+				}(fid)
 			}
+			wg.Wait()
 		}
 	}
 }

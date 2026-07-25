@@ -357,6 +357,7 @@ func (e *syncEngine) scheduleCachePrune() {
 			if err != nil {
 				log.Printf("[mime] 清理缓存失败: %v", err)
 			}
+			e.st.compactEventLogIfNeeded()
 		}
 		prune()
 		ticker := time.NewTicker(24 * time.Hour)

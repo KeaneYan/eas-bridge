@@ -73,6 +73,7 @@ Coremail 对失效 synckey 回 Status 5；但**服务器整体故障时全文件
 
 1. **IMAP UID 1-based 单调递增、持久化**（serverID↔UID 双向映射 + folderMeta.NextUID/UIDValidity）；UIDVALIDITY 恒定，state 重置才 bump（客户端会全量重下）。
 2. **state 分片落盘**（2026-07-25 重构，原单文件 11.5MB 全量重写债）：`state.json` 主文件只存 DeviceID/PolicyKey/SyncKeys/Folders/FolderMeta（KB 级）；`folders/<fid>.json` 存 Items/UIDs/Deleted；`events.json` 存日历。落盘定向化：单封操作只写本文件夹分片，synckey 类只写主文件，syncMailOnce 用 `mutateFolder` 写两者。旧单文件格式首次加载自动迁移（迁移任一分片写失败必须中止，否则主文件瘦身后丢数据）。**synckey 前进必须落盘**（saveNow→主文件），失效 key 重启恢复会被 Coremail 判失效回 Status 5。
+3. **日历事件 = 快照+增量日志**（2026-07-25，原 10.5MB 全量重写债）：写路径只追加 `events.jsonl`（每行 upsert/delete，fsync），读走内存 map，重启快照+幂等重放；坏尾行（崩溃截断）跳过；压实=超 16MB 写快照+截断（启动时+每日）。不变量：事件批次与 synckey 落盘同节奏（崩溃丢的变更 key 也未推进，重拉补回）；"先快照后截断"窗口靠重放幂等安全；所有 jsonl 写者都在 st.mu 下（无 O_APPEND 并发截断竞争）。
 3. **assignUIDs 按传入列表全量重建 UID 映射**——调用方必须传文件夹**全量** items（`addMovedItems` 曾只传增量，清空了目标文件夹原有 UID 映射；ZCode MEDIUM-3 实锤）。
 4. **缓存只存完整结果**：`complete=false` 不写缓存（服务器抖动不固化残缺邮件）。raw.eml 始终缓存。
 5. **只监听 localhost**；InsecureAuth 仅限此场景。config 被改成 0.0.0.0 要拒绝启动。

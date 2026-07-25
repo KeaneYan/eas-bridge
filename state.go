@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -157,11 +160,27 @@ func loadState(path string) (*diskState, error) {
 		}
 	}
 
-	// 3. 日历分片
+	// 3. 日历分片：快照 + events.jsonl 增量日志重放（幂等）
 	if data, err := os.ReadFile(filepath.Join(s.dir, "events.json")); err == nil {
 		var es eventsShard
 		if json.Unmarshal(data, &es) == nil && es.Events != nil {
 			s.Events = es.Events
+		}
+	}
+	if err := s.replayEventLogLocked(); err != nil {
+		// IO 级错误（盘坏/权限）不应让 daemon 起不来：备份坏日志后继续——
+		// 快照仍在，未落快照的变更由下次同步补回（与 state.json 损坏同理，H2 哲学）
+		backup := s.eventLogPath() + ".corrupt-" + time.Now().Format("20060102150405")
+		if rerr := os.Rename(s.eventLogPath(), backup); rerr == nil {
+			log.Printf("[state] events.jsonl 读取失败（%v），已备份到 %s，从快照继续", err, backup)
+		} else {
+			log.Printf("[state] events.jsonl 读取失败（%v）且备份失败（%v），从快照继续", err, rerr)
+		}
+	}
+	// 启动压实：日志超阈值时写快照+截断（daemon 长运行，日志只增不减会无限膨胀）
+	if fi, err := os.Stat(s.eventLogPath()); err == nil && fi.Size() >= eventLogCompactThreshold {
+		if err := s.writeEventsSnapshotLocked(); err != nil {
+			return nil, fmt.Errorf("压实 events.jsonl 失败: %w", err)
 		}
 	}
 
@@ -175,7 +194,7 @@ func loadState(path string) (*diskState, error) {
 				return nil, fmt.Errorf("迁移分片 %s 失败: %w", fid, err)
 			}
 		}
-		if err := s.saveEventsLocked(); err != nil {
+		if err := s.writeEventsSnapshotLocked(); err != nil {
 			return nil, fmt.Errorf("迁移 events.json 失败: %w", err)
 		}
 		if err := s.saveMainLocked(); err != nil {
@@ -255,24 +274,35 @@ func (s *diskState) saveFolderLocked(folderID string) error {
 	return atomicWriteFile(filepath.Join(s.dir, "folders", shardFileName(folderID)), b, 0600)
 }
 
-// saveEventsLocked 写日历事件分片。
-func (s *diskState) saveEventsLocked() error {
+// writeEventsSnapshotLocked 全量写 events.json 快照；成功后截断 events.jsonl
+// （快照已含日志全部内容，重放幂等所以"先快照后截断"的崩溃窗口安全：
+// 崩溃在两者之间 = 旧日志被多放一遍，结果相同）。截断失败只记日志。
+// 调用方须已持 s.mu（或 loadState 单线程阶段）。
+func (s *diskState) writeEventsSnapshotLocked() error {
 	b, err := json.Marshal(eventsShard{Events: s.Events})
 	if err != nil {
 		return err
 	}
-	return atomicWriteFile(filepath.Join(s.dir, "events.json"), b, 0600)
+	if err := atomicWriteFile(filepath.Join(s.dir, "events.json"), b, 0600); err != nil {
+		return err
+	}
+	if _, err := os.Stat(s.eventLogPath()); err == nil {
+		if err := atomicWriteFile(s.eventLogPath(), nil, 0600); err != nil {
+			log.Printf("[state] 截断 events.jsonl 失败（不影响正确性，下轮压实重试）: %v", err)
+		}
+	}
+	return nil
 }
 
-// saveLocked 全量落盘（主+全部分片+事件）。仅用于启动迁移等批量场景；
-// 常规路径用定向落盘（saveMainLocked/saveFolderLocked/saveEventsLocked）。
+// saveLocked 全量落盘（主+全部分片+事件快照）。仅用于启动迁移等批量场景；
+// 常规路径用定向落盘（saveMainLocked/saveFolderLocked/appendEventLogLocked）。
 func (s *diskState) saveLocked() error {
 	for fid := range s.Items {
 		if err := s.saveFolderLocked(fid); err != nil {
 			return err
 		}
 	}
-	if err := s.saveEventsLocked(); err != nil {
+	if err := s.writeEventsSnapshotLocked(); err != nil {
 		return err
 	}
 	return s.saveMainLocked()
@@ -578,10 +608,105 @@ func (s *diskState) saveNow() error {
 	return s.saveMainLocked()
 }
 
-// saveCalendarLocked 日历同步后落盘：事件分片 + 主文件（synckey）。
+// ---------- events.jsonl 增量日志（full-review ROI-4）----------
+//
+// 背景：events.json ~10.5MB（765 事件含 HTML 描述），改造前每次日历写/每 10
+// 页同步都全量 marshal+原子重写。改为 append-only 日志 + 周期压实：
+// 写路径只追加变更行（KB 级），读路径仍全走内存 map，重启时快照+日志重放。
+
+// eventLogCompactThreshold events.jsonl 超过该体积时压实（启动时 + 每日修剪）。
+// 设为 var 以便测试调小。
+var eventLogCompactThreshold = int64(16 << 20) // 16MB
+
+// eventLogEntry 是 events.jsonl 的一行：一次事件 upsert 或 delete。
+type eventLogEntry struct {
+	Upsert *eas.EventItem `json:"upsert,omitempty"`
+	Delete string         `json:"delete,omitempty"`
+}
+
+func (s *diskState) eventLogPath() string { return filepath.Join(s.dir, "events.jsonl") }
+
+// appendEventLogLocked 把事件变更追加到 events.jsonl（每行一条 JSON，flush+fsync）。
+// 崩溃安全：只有最后一行可能写一半，replayEventLogLocked 跳过坏尾行——该行的
+// 变更未被确认，而主文件 synckey 在同批次靠后落盘，崩溃窗口内 key 也未推进，
+// 下次同步会重新拿到这些事件（与改造前"全量写 events.json → 写主文件"的窗口一致）。
+// 调用方须已持 s.mu。
+func (s *diskState) appendEventLogLocked(upserts []eas.EventItem, deletes []string) error {
+	f, err := os.OpenFile(s.eventLogPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	w := bufio.NewWriter(f)
+	writeLine := func(ent eventLogEntry) error {
+		line, err := json.Marshal(ent)
+		if err != nil {
+			return err
+		}
+		if _, err := w.Write(line); err != nil {
+			return err
+		}
+		return w.WriteByte('\n')
+	}
+	for i := range upserts {
+		if err := writeLine(eventLogEntry{Upsert: &upserts[i]}); err != nil {
+			return err
+		}
+	}
+	for _, id := range deletes {
+		if err := writeLine(eventLogEntry{Delete: id}); err != nil {
+			return err
+		}
+	}
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	return f.Sync()
+}
+
+// replayEventLogLocked 重放 events.jsonl 到内存 map（幂等：按 serverID 覆盖/删除）。
+// JSON 不合法的行（崩溃截断的尾行）跳过。
+func (s *diskState) replayEventLogLocked() error {
+	data, err := os.ReadFile(s.eventLogPath())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, line := range bytes.Split(data, []byte{'\n'}) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var ent eventLogEntry
+		if json.Unmarshal(line, &ent) != nil {
+			continue // 崩溃截断的尾行
+		}
+		if ent.Upsert != nil {
+			s.Events[ent.Upsert.ServerID] = *ent.Upsert
+		} else if ent.Delete != "" {
+			delete(s.Events, ent.Delete)
+		}
+	}
+	return nil
+}
+
+// compactEventLogIfNeeded 日志超阈值时压实（每日修剪调用；启动压实在 loadState）。
+func (s *diskState) compactEventLogIfNeeded() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if fi, err := os.Stat(s.eventLogPath()); err != nil || fi.Size() < eventLogCompactThreshold {
+		return
+	}
+	if err := s.writeEventsSnapshotLocked(); err != nil {
+		log.Printf("[state] events.jsonl 压实失败: %v", err)
+	}
+}
+
+// saveCalendarLocked 日历同步批次落盘：事件变更追加 events.jsonl + 主文件（synckey）。
 // 调用方须已持 s.mu（供 syncCalendarOnce 在锁内调用）。
-func (s *diskState) saveCalendarLocked() error {
-	if err := s.saveEventsLocked(); err != nil {
+func (s *diskState) saveCalendarLocked(upserts []eas.EventItem, deletes []string) error {
+	if err := s.appendEventLogLocked(upserts, deletes); err != nil {
 		return err
 	}
 	return s.saveMainLocked()
@@ -595,7 +720,7 @@ func (s *diskState) upsertEvent(ev eas.EventItem) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Events[ev.ServerID] = ev
-	if err := s.saveEventsLocked(); err != nil {
+	if err := s.appendEventLogLocked([]eas.EventItem{ev}, nil); err != nil {
 		return err
 	}
 	return s.saveMainLocked()
@@ -606,7 +731,7 @@ func (s *diskState) deleteEvent(serverID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.Events, serverID)
-	if err := s.saveEventsLocked(); err != nil {
+	if err := s.appendEventLogLocked(nil, []string{serverID}); err != nil {
 		return err
 	}
 	return s.saveMainLocked()
