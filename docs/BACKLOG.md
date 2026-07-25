@@ -4,8 +4,8 @@
 
 ## P1 · 防回归验证
 
-- [ ] **`fetchAttachmentCached` 端到端单测**：生产唯一下载入口零直接覆盖（2026-07-25 图片事故"测试全绿、线上全挂"的漏口）。ZCode attach-review 两轮点名。
-- [ ] **Range 分块路径真实 >8MB 附件实测**：逻辑基于 MS-ASCMD 语义（Range 作用原始字节、每块独立 base64）+ mock 锁定，未对 Coremail 实测。收到大附件时顺手验魔数即可，不用专门造。
+- [ ] **单附件邮件 `fetchMIME` 全量重建链路零覆盖**（p1-tests-review R1）：bodySection 在 actual==all 时走全量重建分支，现有端到端测试刻意用两附件避开。
+- [ ] **singleflight 并发去重直接测试**（p1-tests-review R2）：flightGroup 合并行为目前只被退避并发测试间接覆盖。
 
 ## P2 · 性能
 

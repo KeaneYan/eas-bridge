@@ -231,3 +231,136 @@ func TestFailedBodyFetchIsNotCachedAndRetries(t *testing.T) {
 		t.Fatalf("complete metadata was not cached: %v", err)
 	}
 }
+
+// fetchAttachmentCached 端到端：FetchAttachment 返回的 base64 原文必须解码后
+// 返回并落缓存；第二次调用走缓存不再打服务器；缓存文件内容是原始字节。
+// （2026-07-25 图片事故的生产路径，此前零直接覆盖——ZCode 两轮点名）
+func TestFetchAttachmentCachedDecodesAndCaches(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	payload := append([]byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}, bytes.Repeat([]byte{7, 8, 9}, 100)...)
+	meta := eas.Attachment{
+		FileReference:     "ref-1",
+		DisplayName:       "logo.png",
+		EstimatedDataSize: int64(len(payload)),
+	}
+	calls := 0
+	engine := &syncEngine{c: &easmock.Client{
+		FolderClient: easmock.FolderClient{
+			FetchAttachmentFunc: func(context.Context, string, int64, int64) (*eas.FetchAttachmentResult, error) {
+				calls++
+				return &eas.FetchAttachmentResult{
+					Data: []byte(base64.StdEncoding.EncodeToString(payload)),
+				}, nil
+			},
+		},
+	}}
+
+	got, err := engine.fetchAttachmentCached(context.Background(), "folder", "message", meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("第一次调用应返回解码后原始字节，got %d bytes head %x", len(got), got[:min(8, len(got))])
+	}
+
+	got2, err := engine.fetchAttachmentCached(context.Background(), "folder", "message", meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got2, payload) {
+		t.Fatal("缓存命中返回内容不一致")
+	}
+	if calls != 1 {
+		t.Fatalf("第二次调用应走缓存，FetchAttachment 被调 %d 次", calls)
+	}
+
+	// 缓存文件里存的必须是解码后的原始字节（不是 base64 文本）
+	cached, err := os.ReadFile(attachmentCachePath("folder", "message", "ref-1"))
+	if err != nil {
+		t.Fatalf("缓存文件不存在: %v", err)
+	}
+	if !bytes.Equal(cached, payload) {
+		t.Fatalf("缓存文件内容 = %d bytes head %x，应为原始字节", len(cached), cached[:min(8, len(cached))])
+	}
+}
+
+// 下载失败不写缓存，下次调用重试（服务器抖动不固化失败）。
+func TestFetchAttachmentCachedErrorNotCached(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	payload := bytes.Repeat([]byte{1, 2, 3, 4}, 50)
+	meta := eas.Attachment{FileReference: "ref-err", EstimatedDataSize: int64(len(payload))}
+	calls := 0
+	engine := &syncEngine{c: &easmock.Client{
+		FolderClient: easmock.FolderClient{
+			FetchAttachmentFunc: func(context.Context, string, int64, int64) (*eas.FetchAttachmentResult, error) {
+				calls++
+				if calls == 1 {
+					return nil, errors.New("server wobble")
+				}
+				return &eas.FetchAttachmentResult{
+					Data: []byte(base64.StdEncoding.EncodeToString(payload)),
+				}, nil
+			},
+		},
+	}}
+	if _, err := engine.fetchAttachmentCached(context.Background(), "folder", "message", meta); err == nil {
+		t.Fatal("第一次应返回错误")
+	}
+	if _, err := os.Stat(attachmentCachePath("folder", "message", "ref-err")); !os.IsNotExist(err) {
+		t.Fatalf("失败后不应落缓存文件: %v", err)
+	}
+	got, err := engine.fetchAttachmentCached(context.Background(), "folder", "message", meta)
+	if err != nil {
+		t.Fatalf("第二次应重试成功: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("重试后内容不符")
+	}
+	if calls != 2 {
+		t.Fatalf("FetchAttachment 调用 %d 次，want 2", calls)
+	}
+}
+
+// 端到端：plan.bodySection 取附件部件 → 生产路径 fetchAttachmentCached →
+// MIME 里的 base64 解一层必须等于原始字节（双层 base64 事故的全链路回归）。
+func TestBodySectionAttachmentEndToEndBase64(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	payload := append([]byte{0xFF, 0xD8, 0xFF, 0xE0}, bytes.Repeat([]byte{5, 6}, 200)...) // JPEG magic
+	engine := &syncEngine{c: &easmock.Client{
+		FolderClient: easmock.FolderClient{
+			FetchAttachmentFunc: func(context.Context, string, int64, int64) (*eas.FetchAttachmentResult, error) {
+				return &eas.FetchAttachmentResult{
+					Data: []byte(base64.StdEncoding.EncodeToString(payload)),
+				}, nil
+			},
+		},
+	}}
+	plan := newMessagePlan("folder", "message", eas.EmailItem{
+		ServerID: "message",
+		BodyType: eas.BodyTypeHTML,
+		Body:     `<p>message</p>`,
+		Attachments: []eas.Attachment{
+			// 两个附件：请求 part 2（regular）时 actual != all，走 render 路径
+			// （单附件会走 fetchMIME 全量重建路径，那是另一条链路）
+			{FileReference: "inline", DisplayName: "inline.png", ContentID: "inline", IsInline: true, EstimatedDataSize: 11},
+			{
+				FileReference:     "photo",
+				DisplayName:       "photo.jpg",
+				ContentType:       "image/jpeg",
+				EstimatedDataSize: int64(len(payload)),
+			},
+		},
+	}, "message")
+
+	body, err := plan.bodySection(context.Background(), engine, &imap.FetchItemBodySection{Part: []int{2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(string(bytes.TrimSpace(body)))
+	if err != nil {
+		t.Fatalf("附件部件不是合法 base64: %v", err)
+	}
+	if !bytes.Equal(decoded, payload) {
+		t.Fatalf("解一层后 head %x，应为 JPEG 原始字节（双层 base64 回归）", decoded[:min(8, len(decoded))])
+	}
+}
