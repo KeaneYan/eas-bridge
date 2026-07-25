@@ -280,40 +280,72 @@ func parseICalAlarmMinutes(e *ical.Event) int {
 }
 
 // parseICalDurationMinutes 解析 "-PT15M" / "-PT1H30M" / "-P1D" 为提前分钟数。
-// 只处理负向（提前）触发；正向（事后）返回 0。
+// 只处理负向（提前）触发；正向、畸形、无法表示的（月/秒级）一律返回 false——
+// 绝不把畸形输入当 "提前 0 分钟"：parseICalAlarmMinutes 遇到 false 会继续尝试
+// 下一个 VALARM，返回 (0,true) 会让畸形第一个闹钟掩盖后面合法的那个
+// （2026-07-25 ZCode full-review LOW）。
 func parseICalDurationMinutes(v string) (int, bool) {
 	v = strings.ToUpper(strings.TrimSpace(v))
 	if v == "" || !strings.HasPrefix(v, "-P") {
 		return 0, false
 	}
 	v = strings.TrimPrefix(v, "-P")
+	if v == "" {
+		return 0, false // "-P" 空时长
+	}
 	total := 0
 	inTime := false
 	num := ""
+	parsed := false
 	for _, ch := range v {
 		switch {
 		case ch == 'T':
+			if inTime {
+				return 0, false // 第二个 T
+			}
 			inTime = true
 		case ch >= '0' && ch <= '9':
 			num += string(ch)
 		default:
-			n, _ := strconv.Atoi(num)
+			n, err := strconv.Atoi(num)
+			if err != nil {
+				return 0, false // 设计符前必须有数字（-PTM / -PD 之类）
+			}
 			num = ""
 			switch ch {
 			case 'D':
 				total += n * 24 * 60
+				parsed = true
 			case 'W':
 				total += n * 7 * 24 * 60
+				parsed = true
 			case 'H':
-				if inTime {
-					total += n * 60
+				if !inTime {
+					return 0, false
 				}
+				total += n * 60
+				parsed = true
 			case 'M':
-				if inTime {
-					total += n
+				if !inTime {
+					return 0, false // 日期段的 M 是"月"，无法折算分钟，拒绝而非静默丢弃
 				}
+				total += n
+				parsed = true
+			case 'S':
+				if !inTime {
+					return 0, false
+				}
+				// 秒级提醒合法但无法折算：不计分钟、不算解析成功（-PT30S → false）
+			default:
+				return 0, false
 			}
 		}
+	}
+	if num != "" {
+		return 0, false // 尾随数字无设计符（"-PT15"）
+	}
+	if !parsed {
+		return 0, false
 	}
 	return total, true
 }

@@ -646,12 +646,46 @@ func writeBase64Placeholder(w io.Writer, rawSize int64) error {
 	return nil
 }
 
+// splitEASAddresses 按 EAS 的分号分隔切地址列表，忽略引号内（含转义）的分号。
+// 显示名可能含字面分号（如 "a;b" <x@y>）——直接 ReplaceAll/Split 会把名字
+// 切开或篡改（2026-07-25 ZCode full-review LOW）。
+func splitEASAddresses(value string) []string {
+	var out []string
+	var b strings.Builder
+	inQuote, escaped := false, false
+	flush := func() {
+		if s := strings.TrimSpace(b.String()); s != "" {
+			out = append(out, s)
+		}
+		b.Reset()
+	}
+	for _, ch := range value {
+		switch {
+		case escaped:
+			b.WriteRune(ch)
+			escaped = false
+		case ch == '\\' && inQuote:
+			b.WriteRune(ch)
+			escaped = true
+		case ch == '"':
+			inQuote = !inQuote
+			b.WriteRune(ch)
+		case ch == ';' && !inQuote:
+			flush()
+		default:
+			b.WriteRune(ch)
+		}
+	}
+	flush()
+	return out
+}
+
 func formatAddressHeader(value string) string {
 	value = sanitizeHeader(value)
 	if value == "" {
 		return ""
 	}
-	addresses, err := mail.ParseAddressList(strings.ReplaceAll(value, ";", ","))
+	addresses, err := mail.ParseAddressList(strings.Join(splitEASAddresses(value), ", "))
 	if err != nil {
 		return formatAddressHeaderFallback(value)
 	}
@@ -663,7 +697,7 @@ func formatAddressHeader(value string) string {
 }
 
 func formatAddressHeaderFallback(value string) string {
-	parts := strings.Split(value, ";")
+	parts := splitEASAddresses(value)
 	formatted := make([]string, 0, len(parts))
 	for _, part := range parts {
 		part = strings.TrimSpace(part)

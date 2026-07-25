@@ -400,3 +400,36 @@ func TestFetchAndBuildMIMEDecodesBase64Attachment(t *testing.T) {
 	assertLeaf(t, leaves, "image/png", "inline", "logo.png", payload)
 	assertLeaf(t, leaves, "application/pdf", "attachment", "报告.pdf", payload)
 }
+
+// 显示名含字面分号时不得切开/篡改（EAS 用 ; 分隔地址，引号内的 ; 属于名字）。
+func TestFormatAddressHeaderSemicolonInDisplayName(t *testing.T) {
+	got := formatAddressHeader(`"a;b" <x@y.com>; c@d.com`)
+	if !strings.Contains(got, "a;b") {
+		t.Fatalf("引号内分号被篡改: %q", got)
+	}
+	if !strings.Contains(got, "c@d.com") {
+		t.Fatalf("第二个地址丢失: %q", got)
+	}
+	// 必须是两个地址而不是三个
+	if n := strings.Count(got, "@"); n != 2 {
+		t.Fatalf("地址数错误（%d 个 @）: %q", n, got)
+	}
+}
+
+func TestSplitEASAddresses(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int
+	}{
+		{`a@b.com; c@d.com`, 2},
+		{`"a;b" <x@y.com>; c@d.com`, 2},
+		{`"a\";b" <x@y.com>; c@d.com`, 2}, // 转义引号不终止引号段
+		{`a@b.com`, 1},
+		{`a@b.com;;c@d.com;`, 2}, // 空段忽略
+	}
+	for _, c := range cases {
+		if got := splitEASAddresses(c.in); len(got) != c.want {
+			t.Errorf("splitEASAddresses(%q) = %v（%d 段），want %d 段", c.in, got, len(got), c.want)
+		}
+	}
+}

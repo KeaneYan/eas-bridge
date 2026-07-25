@@ -250,6 +250,17 @@ func TestParseICalDurationMinutes(t *testing.T) {
 	if _, ok := parseICalDurationMinutes("PT10M"); ok {
 		t.Error("正向触发应返回 false")
 	}
+	// 畸形/无法表示的输入必须 false，绝不按"提前 0 分钟"处理
+	// （false 会让 parseICalAlarmMinutes 继续尝试下一个 VALARM）
+	for _, bad := range []string{"-P", "-PT", "-PTM", "-PD", "-P1M", "-PT15", "-PTT15M", "-P1X", "-PT30S", "-P1H"} {
+		if _, ok := parseICalDurationMinutes(bad); ok {
+			t.Errorf("%s 应返回 false", bad)
+		}
+	}
+	// 组合时长
+	if got, ok := parseICalDurationMinutes("-P1W2DT3H4M"); !ok || got != 1*7*24*60+2*24*60+3*60+4 {
+		t.Errorf("-P1W2DT3H4M = %d,%v", got, ok)
+	}
 }
 
 func TestAllDayEventCreate(t *testing.T) {
