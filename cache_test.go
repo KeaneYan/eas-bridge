@@ -129,3 +129,26 @@ func TestFlightGroupWaiterRespectsCancellation(t *testing.T) {
 	close(release)
 	<-finished
 }
+
+// 不同 key 各自独立执行（互不去重）。
+func TestFlightGroupDistinctKeysIndependent(t *testing.T) {
+	var g flightGroup
+	var calls int32
+	var wg sync.WaitGroup
+	for _, key := range []string{"a", "b", "c"} {
+		wg.Add(1)
+		go func(k string) {
+			defer wg.Done()
+			if _, err := g.DoContext(context.Background(), k, func() (any, error) {
+				atomic.AddInt32(&calls, 1)
+				return nil, nil
+			}); err != nil {
+				t.Error(err)
+			}
+		}(key)
+	}
+	wg.Wait()
+	if got := atomic.LoadInt32(&calls); got != 3 {
+		t.Fatalf("3 个不同 key 应各执行一次，实际 %d", got)
+	}
+}

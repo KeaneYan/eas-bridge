@@ -364,3 +364,83 @@ func TestBodySectionAttachmentEndToEndBase64(t *testing.T) {
 		t.Fatalf("解一层后 head %x，应为 JPEG 原始字节（双层 base64 回归）", decoded[:min(8, len(decoded))])
 	}
 }
+
+// R1：单附件邮件取附件部件 → bodySection 的 actual==all 分支 → fetchMIME
+// 全量重建链路（prepareMessage→fetchMessageSource→render 全附件）。
+// 这是生产上"打开只有一封一个附件的邮件"的真实路径，此前零覆盖。
+func TestFetchMIMEFullRebuildSingleAttachment(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	payload := append([]byte{0x89, 0x50, 0x4E, 0x47}, bytes.Repeat([]byte{9, 9, 9}, 100)...)
+	att := eas.Attachment{
+		FileReference:     "only",
+		DisplayName:       "only.png",
+		ContentType:       "image/png",
+		EstimatedDataSize: int64(len(payload)),
+	}
+	st := mustLoadTestState(t)
+	st.Folders = []eas.Folder{{ServerID: "folder", Type: eas.FolderTypeInbox}}
+	st.Items["folder"] = []eas.EmailItem{{
+		ServerID:       "message",
+		Subject:        "单附件邮件",
+		HasAttachments: true,
+		Attachments:    []eas.Attachment{att},
+	}}
+	engine := &syncEngine{
+		st: st,
+		c: &easmock.Client{
+			EmailClient: easmock.EmailClient{
+				FetchEmailFunc: func(_ context.Context, _, serverID string, opts eas.FetchEmailOptions) (*eas.EmailItem, error) {
+					switch opts.BodyType {
+					case eas.BodyTypeMIME:
+						return &eas.EmailItem{ServerID: serverID}, nil // 无原始 MIME → 重建路径
+					case eas.BodyTypeHTML:
+						return &eas.EmailItem{
+							ServerID:       serverID,
+							Subject:        "单附件邮件",
+							From:           "sender@example.com",
+							To:             "receiver@example.com",
+							BodyType:       eas.BodyTypeHTML,
+							Body:           `<p>hi</p>`,
+							HasAttachments: true,
+							Attachments:    []eas.Attachment{att},
+						}, nil
+					default:
+						return &eas.EmailItem{ServerID: serverID, BodyType: eas.BodyTypePlain, Body: "hi"}, nil
+					}
+				},
+			},
+			FolderClient: easmock.FolderClient{
+				FetchAttachmentFunc: func(context.Context, string, int64, int64) (*eas.FetchAttachmentResult, error) {
+					return &eas.FetchAttachmentResult{
+						Data: []byte(base64.StdEncoding.EncodeToString(payload)),
+					}, nil
+				},
+			},
+		},
+	}
+
+	// 生产入口：prepareMessage 拿 plan → bodySection 取附件部件（actual==all → fetchMIME）
+	plan, err := engine.prepareMessage(context.Background(), "folder", "message")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := plan.bodySection(context.Background(), engine, &imap.FetchItemBodySection{Part: []int{2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(string(bytes.TrimSpace(body)))
+	if err != nil {
+		t.Fatalf("附件部件不是合法 base64: %v", err)
+	}
+	if !bytes.Equal(decoded, payload) {
+		t.Fatalf("全量重建链路解一层后 head %x，应为原始字节", decoded[:min(8, len(decoded))])
+	}
+	// full.eml 应已落缓存且合法
+	full, err := os.ReadFile(messageFullMIMEPath("folder", "message"))
+	if err != nil {
+		t.Fatalf("full.eml 未落缓存: %v", err)
+	}
+	if !validRFC822(full) {
+		t.Fatal("full.eml 不是合法 RFC822")
+	}
+}

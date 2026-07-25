@@ -2,11 +2,6 @@
 
 > 2026-07-25 整理：当日两轮修复（附件双层 base64、Status 5 退避）的审查遗留 + 前日全量审查（ZCode full-review）未做项。按优先级排序，完成即删。
 
-## P1 · 防回归验证
-
-- [ ] **单附件邮件 `fetchMIME` 全量重建链路零覆盖**（p1-tests-review R1）：bodySection 在 actual==all 时走全量重建分支，现有端到端测试刻意用两附件避开。
-- [ ] **singleflight 并发去重直接测试**（p1-tests-review R2）：flightGroup 合并行为目前只被退避并发测试间接覆盖。
-
 ## P2 · 性能
 
 - [ ] **events.json 10.5MB 全量重写 → append-only JSONL + 周期压实**（full-review ROI-4）：读路径零影响（内存 map 不变），优于按年分片（避开跨年 time-range 合并多片）。
