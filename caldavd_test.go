@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -184,5 +185,44 @@ func TestCalendarReadWaitsForInFlightSyncWhenCacheIsEmpty(t *testing.T) {
 	}
 	if _, ok := st.Events[event.ServerID]; !ok {
 		t.Fatal("等待预热完成后仍未加载日历事件")
+	}
+}
+
+func TestCalendarReadReturns503WhenInitialSyncFails(t *testing.T) {
+	st := mustLoadTestState(t)
+	st.Folders = []eas.Folder{{ServerID: "calendar", Type: eas.FolderTypeCalendar}}
+	engine := &syncEngine{
+		st: st,
+		c: &easmock.Client{
+			CalendarClient: easmock.CalendarClient{
+				SyncCalendarFunc: func(context.Context, string, eas.CalendarSyncOptions) (*eas.CalendarSyncResult, error) {
+					return nil, errors.New("temporary EAS outage")
+				},
+			},
+		},
+	}
+	backend := &caldavBackend{engine: engine}
+
+	_, err := backend.ListCalendarObjects(context.Background(), caldavCalendarPath, nil)
+	if err == nil || !strings.HasPrefix(err.Error(), "503 Service Unavailable") {
+		t.Fatalf("initial sync error = %v, want 503 Service Unavailable", err)
+	}
+}
+
+func TestEmptyCalendarWithPersistedSyncKeyIsUsableCache(t *testing.T) {
+	st := mustLoadTestState(t)
+	st.Folders = []eas.Folder{{ServerID: "calendar", Type: eas.FolderTypeCalendar}}
+	st.SyncKeys["calendar"] = "synced-empty-calendar"
+	backend := &caldavBackend{
+		engine:      &syncEngine{st: st},
+		lastCalSync: time.Now(),
+	}
+
+	objects, err := backend.ListCalendarObjects(context.Background(), caldavCalendarPath, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objects) != 0 {
+		t.Fatalf("empty synced calendar returned %d objects", len(objects))
 	}
 }
