@@ -68,17 +68,20 @@ func main() {
 	}()
 
 	// 启动 CalDAV 服务
-	calSrv := newCalDAVServer(engine, cfg.CalDAVAddr)
+	calBackend := &caldavBackend{engine: engine}
+	calSrv := newCalDAVServer(calBackend, cfg.CalDAVAddr)
 	go func() {
 		if err := calSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal("[caldav] ", err)
 		}
 	}()
 
-	// 启动轮询（变更时 fan-out 广播给所有 IDLE 会话）
+	// 启动邮件和日历轮询。邮件变更时 fan-out 广播给所有 IDLE 会话；
+	// 日历独立后台拉取，不依赖 CalDAV 客户端是否打开。
 	go engine.poller(ctx, time.Duration(cfg.PollSecs)*time.Second, func(folderID string) {
 		imapD.broadcast(folderID)
 	})
+	go calBackend.calendarPoller(ctx, time.Duration(cfg.PollSecs)*time.Second)
 
 	log.Printf("[eas-bridge] 就绪。IMAP %s  SMTP %s  CalDAV %s（Ctrl+C 退出）", cfg.IMAPAddr, cfg.SMTPAddr, cfg.CalDAVAddr)
 
@@ -92,7 +95,7 @@ func main() {
 		log.Println("[sync] 邮件预热完成")
 	}()
 	go func() {
-		if err := engine.syncCalendar(ctx); err != nil {
+		if err := calBackend.syncCalendar(ctx); err != nil {
 			log.Printf("[sync] 日历预热失败（查询时会重试）: %v", err)
 			return
 		}

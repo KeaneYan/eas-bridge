@@ -394,11 +394,11 @@ func TestCalendarBackoffSkipDoesNotAdvanceLastSync(t *testing.T) {
 	}
 
 	b := &caldavBackend{engine: engine}
-	b.finishCalendarSync(err)
+	b.finishCalendarSync(&calendarSyncCall{done: make(chan struct{})}, err)
 	if !b.lastCalSync.IsZero() {
 		t.Fatal("sentinel 不应推进 lastCalSync")
 	}
-	b.finishCalendarSync(nil)
+	b.finishCalendarSync(&calendarSyncCall{done: make(chan struct{})}, nil)
 	if b.lastCalSync.IsZero() {
 		t.Fatal("成功同步应推进 lastCalSync")
 	}

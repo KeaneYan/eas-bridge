@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/hstern/go-activesync/eas"
+	"github.com/hstern/go-activesync/eas/easmock"
 )
 
 func TestLogCalDAVFailuresPreservesStatusAndBody(t *testing.T) {
@@ -73,5 +78,111 @@ func TestHandleAppleCalendarPropertiesPassesUnknownProperty(t *testing.T) {
 
 	if forwarded != body {
 		t.Fatalf("forwarded body changed: %q", forwarded)
+	}
+}
+
+func TestCalendarPollerSyncsEveryIntervalAndStops(t *testing.T) {
+	st := mustLoadTestState(t)
+	st.Folders = []eas.Folder{{ServerID: "calendar", Type: eas.FolderTypeCalendar}}
+
+	synced := make(chan struct{}, 2)
+	engine := &syncEngine{
+		st: st,
+		c: &easmock.Client{
+			CalendarClient: easmock.CalendarClient{
+				SyncCalendarFunc: func(context.Context, string, eas.CalendarSyncOptions) (*eas.CalendarSyncResult, error) {
+					select {
+					case synced <- struct{}{}:
+					default:
+					}
+					return &eas.CalendarSyncResult{}, nil
+				},
+			},
+		},
+	}
+	backend := &caldavBackend{engine: engine}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		backend.calendarPoller(ctx, 20*time.Millisecond)
+		close(done)
+	}()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-synced:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("日历轮询器只触发了 %d 次同步，期望连续两个间隔均触发", i)
+		}
+	}
+
+	deadline := time.After(2 * time.Second)
+	for {
+		backend.calMu.Lock()
+		syncFinished := !backend.lastCalSync.IsZero()
+		backend.calMu.Unlock()
+		if syncFinished {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("成功的定时同步未更新 lastCalSync")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("日历轮询器未在 cancel 后退出")
+	}
+}
+
+func TestCalendarReadWaitsForInFlightSyncWhenCacheIsEmpty(t *testing.T) {
+	st := mustLoadTestState(t)
+	st.Folders = []eas.Folder{{ServerID: "calendar", Type: eas.FolderTypeCalendar}}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	event := eas.EventItem{ServerID: "Event:1", UID: "uid-1", Subject: "loaded"}
+	engine := &syncEngine{
+		st: st,
+		c: &easmock.Client{
+			CalendarClient: easmock.CalendarClient{
+				SyncCalendarFunc: func(context.Context, string, eas.CalendarSyncOptions) (*eas.CalendarSyncResult, error) {
+					close(started)
+					<-release
+					return &eas.CalendarSyncResult{Added: []eas.EventItem{event}}, nil
+				},
+			},
+		},
+	}
+	backend := &caldavBackend{engine: engine}
+
+	prewarmDone := make(chan error, 1)
+	go func() {
+		prewarmDone <- backend.syncCalendar(context.Background())
+	}()
+	<-started
+
+	readDone := make(chan error, 1)
+	go func() {
+		readDone <- backend.maybeSyncCalendar(context.Background())
+	}()
+	select {
+	case err := <-readDone:
+		t.Fatalf("空缓存查询在预热完成前返回: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	if err := <-prewarmDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-readDone; err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st.Events[event.ServerID]; !ok {
+		t.Fatal("等待预热完成后仍未加载日历事件")
 	}
 }

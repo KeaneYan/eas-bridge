@@ -15,7 +15,7 @@ type config struct {
 	IMAPAddr   string `json:"imap_addr"`    // 监听地址，默认 "127.0.0.1:1143"
 	SMTPAddr   string `json:"smtp_addr"`    // 监听地址，默认 "127.0.0.1:1025"
 	CalDAVAddr string `json:"caldav_addr"`  // 监听地址，默认 "127.0.0.1:8008"
-	PollSecs   int    `json:"poll_seconds"` // 邮件同步间隔，默认 60
+	PollSecs   int    `json:"poll_seconds"` // 邮件和日历同步间隔，默认 60
 }
 
 func configDir() string {

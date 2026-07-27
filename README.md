@@ -47,6 +47,8 @@ go build -o eas-bridge .
 }
 ```
 
+`poll_seconds` 同时控制邮件和日历的后台同步间隔；默认 60 秒。日历会独立定时拉取，不需要保持 Apple 日历处于打开状态。
+
 ## 后台常驻（launchd，推荐）
 
 `contrib/com.keaneyan.eas-bridge.plist` 是 macOS launchd 服务配置（开机自启 + 崩溃自动拉起，日志到 `~/Library/Logs/eas-bridge.log`）：

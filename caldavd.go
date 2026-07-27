@@ -37,7 +37,12 @@ type caldavBackend struct {
 
 	calMu       sync.Mutex
 	lastCalSync time.Time
-	calSyncing  bool
+	calSyncCall *calendarSyncCall
+}
+
+type calendarSyncCall struct {
+	done chan struct{}
+	err  error
 }
 
 // ---------- Backend 接口 ----------
@@ -128,39 +133,84 @@ func (b *caldavBackend) maybeSyncCalendar(ctx context.Context) error {
 		b.calMu.Unlock()
 		return nil
 	}
-	if b.calSyncing {
-		b.calMu.Unlock()
-		return nil
-	}
+	b.calMu.Unlock()
+
 	b.engine.st.mu.Lock()
 	hasCachedEvents := len(b.engine.st.Events) > 0
 	b.engine.st.mu.Unlock()
-	b.calSyncing = true
-	b.calMu.Unlock()
 
 	if hasCachedEvents {
 		go func() {
 			syncCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 			defer cancel()
-			b.finishCalendarSync(b.engine.syncCalendar(syncCtx))
+			if err := b.syncCalendar(syncCtx); err != nil {
+				log.Printf("[caldav] 后台同步失败（继续使用缓存）: %v", err)
+			}
 		}()
 		return nil
 	}
+	return b.syncCalendar(ctx)
+}
+
+// syncCalendar 串行化所有日历同步入口，并在真实成功后更新 CalDAV 新鲜度。
+// 定时轮询、启动预热和客户端按需刷新共用此入口，避免重复请求 EAS。
+func (b *caldavBackend) syncCalendar(ctx context.Context) error {
+	b.calMu.Lock()
+	if call := b.calSyncCall; call != nil {
+		b.calMu.Unlock()
+		select {
+		case <-call.done:
+			return normalizeCalendarSyncError(call.err)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	call := &calendarSyncCall{done: make(chan struct{})}
+	b.calSyncCall = call
+	b.calMu.Unlock()
+
 	err := b.engine.syncCalendar(ctx)
-	b.finishCalendarSync(err)
+	b.finishCalendarSync(call, err)
+	return normalizeCalendarSyncError(err)
+}
+
+func normalizeCalendarSyncError(err error) error {
 	if errors.Is(err, ErrSyncBackoffSkip) {
-		return nil // 退避跳过不是故障，lastCalSync 不推进（下轮查询会再试）
+		return nil // 退避跳过不是故障，lastCalSync 不推进（下轮轮询会再试）
 	}
 	return err
 }
 
-func (b *caldavBackend) finishCalendarSync(err error) {
+// calendarPoller 定时主动同步日历，不依赖 Apple 日历发起 CalDAV 请求。
+func (b *caldavBackend) calendarPoller(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			syncCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+			err := b.syncCalendar(syncCtx)
+			cancel()
+			if err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("[poll] syncCalendar: %v", err)
+			}
+		}
+	}
+}
+
+func (b *caldavBackend) finishCalendarSync(call *calendarSyncCall, err error) {
 	b.calMu.Lock()
 	defer b.calMu.Unlock()
-	b.calSyncing = false
+	call.err = err
+	if b.calSyncCall == call {
+		b.calSyncCall = nil
+	}
 	if err == nil {
 		b.lastCalSync = time.Now()
 	}
+	close(call.done)
 }
 
 // allObjects 把缓存中全部事件转成 CalendarObject（按 StartTime 排序，稳定输出）。
@@ -405,12 +455,11 @@ func easRecurrenceToRRULE(r *eas.Recurrence) string {
 
 // newCalDAVServer 构建 CalDAV HTTP 服务（Basic + Digest 认证），由 main 启动/优雅关闭。
 // Digest 必须存在：macOS CoreDAV 拒绝明文 HTTP 上的 Basic（见 digest.go 头部注释）。
-func newCalDAVServer(engine *syncEngine, addr string) *http.Server {
-	backend := &caldavBackend{engine: engine}
+func newCalDAVServer(backend *caldavBackend, addr string) *http.Server {
 	handler := &caldav.Handler{Backend: backend}
 	compatibleHandler := logCalDAVFailures(handleAppleCalendarProperties(handler))
 
-	cfg := engine.cfg
+	cfg := backend.engine.cfg
 	dk := newDigestKeys()
 	authed := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !caldavAuthorized(r, cfg.User, cfg.Password, dk) {
