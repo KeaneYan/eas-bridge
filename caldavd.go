@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -34,7 +37,12 @@ type caldavBackend struct {
 
 	calMu       sync.Mutex
 	lastCalSync time.Time
-	calSyncing  bool
+	calSyncCall *calendarSyncCall
+}
+
+type calendarSyncCall struct {
+	done chan struct{}
+	err  error
 }
 
 // ---------- Backend 接口 ----------
@@ -125,39 +133,84 @@ func (b *caldavBackend) maybeSyncCalendar(ctx context.Context) error {
 		b.calMu.Unlock()
 		return nil
 	}
-	if b.calSyncing {
-		b.calMu.Unlock()
-		return nil
-	}
+	b.calMu.Unlock()
+
 	b.engine.st.mu.Lock()
 	hasCachedEvents := len(b.engine.st.Events) > 0
 	b.engine.st.mu.Unlock()
-	b.calSyncing = true
-	b.calMu.Unlock()
 
 	if hasCachedEvents {
 		go func() {
 			syncCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 			defer cancel()
-			b.finishCalendarSync(b.engine.syncCalendar(syncCtx))
+			if err := b.syncCalendar(syncCtx); err != nil {
+				log.Printf("[caldav] 后台同步失败（继续使用缓存）: %v", err)
+			}
 		}()
 		return nil
 	}
+	return b.syncCalendar(ctx)
+}
+
+// syncCalendar 串行化所有日历同步入口，并在真实成功后更新 CalDAV 新鲜度。
+// 定时轮询、启动预热和客户端按需刷新共用此入口，避免重复请求 EAS。
+func (b *caldavBackend) syncCalendar(ctx context.Context) error {
+	b.calMu.Lock()
+	if call := b.calSyncCall; call != nil {
+		b.calMu.Unlock()
+		select {
+		case <-call.done:
+			return normalizeCalendarSyncError(call.err)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	call := &calendarSyncCall{done: make(chan struct{})}
+	b.calSyncCall = call
+	b.calMu.Unlock()
+
 	err := b.engine.syncCalendar(ctx)
-	b.finishCalendarSync(err)
+	b.finishCalendarSync(call, err)
+	return normalizeCalendarSyncError(err)
+}
+
+func normalizeCalendarSyncError(err error) error {
 	if errors.Is(err, ErrSyncBackoffSkip) {
-		return nil // 退避跳过不是故障，lastCalSync 不推进（下轮查询会再试）
+		return nil // 退避跳过不是故障，lastCalSync 不推进（下轮轮询会再试）
 	}
 	return err
 }
 
-func (b *caldavBackend) finishCalendarSync(err error) {
+// calendarPoller 定时主动同步日历，不依赖 Apple 日历发起 CalDAV 请求。
+func (b *caldavBackend) calendarPoller(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			syncCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+			err := b.syncCalendar(syncCtx)
+			cancel()
+			if err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("[poll] syncCalendar: %v", err)
+			}
+		}
+	}
+}
+
+func (b *caldavBackend) finishCalendarSync(call *calendarSyncCall, err error) {
 	b.calMu.Lock()
 	defer b.calMu.Unlock()
-	b.calSyncing = false
+	call.err = err
+	if b.calSyncCall == call {
+		b.calSyncCall = nil
+	}
 	if err == nil {
 		b.lastCalSync = time.Now()
 	}
+	close(call.done)
 }
 
 // allObjects 把缓存中全部事件转成 CalendarObject（按 StartTime 排序，稳定输出）。
@@ -402,11 +455,11 @@ func easRecurrenceToRRULE(r *eas.Recurrence) string {
 
 // newCalDAVServer 构建 CalDAV HTTP 服务（Basic + Digest 认证），由 main 启动/优雅关闭。
 // Digest 必须存在：macOS CoreDAV 拒绝明文 HTTP 上的 Basic（见 digest.go 头部注释）。
-func newCalDAVServer(engine *syncEngine, addr string) *http.Server {
-	backend := &caldavBackend{engine: engine}
+func newCalDAVServer(backend *caldavBackend, addr string) *http.Server {
 	handler := &caldav.Handler{Backend: backend}
+	compatibleHandler := logCalDAVFailures(handleAppleCalendarProperties(handler))
 
-	cfg := engine.cfg
+	cfg := backend.engine.cfg
 	dk := newDigestKeys()
 	authed := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !caldavAuthorized(r, cfg.User, cfg.Password, dk) {
@@ -415,11 +468,127 @@ func newCalDAVServer(engine *syncEngine, addr string) *http.Server {
 			http.Error(w, "未授权", http.StatusUnauthorized)
 			return
 		}
-		handler.ServeHTTP(w, r)
+		compatibleHandler.ServeHTTP(w, r)
 	})
 
 	log.Printf("[caldav] 监听 %s", addr)
 	return &http.Server{Addr: addr, Handler: authed}
+}
+
+type calDAVStatusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *calDAVStatusWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *calDAVStatusWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+// logCalDAVFailures records enough protocol context to diagnose client
+// compatibility issues without logging request bodies or credentials.
+func logCalDAVFailures(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var propertyNames []string
+		if r.Method == "PROPPATCH" && r.Body != nil {
+			body, err := io.ReadAll(r.Body)
+			if err == nil {
+				r.Body = io.NopCloser(bytes.NewReader(body))
+				propertyNames = calDAVPropertyNames(body)
+			}
+		}
+		sw := &calDAVStatusWriter{ResponseWriter: w}
+		next.ServeHTTP(sw, r)
+		if sw.status >= http.StatusBadRequest {
+			if len(propertyNames) > 0 {
+				log.Printf("[caldav] %s %s properties=%s -> %d", r.Method, r.URL.EscapedPath(), strings.Join(propertyNames, ","), sw.status)
+			} else {
+				log.Printf("[caldav] %s %s -> %d", r.Method, r.URL.EscapedPath(), sw.status)
+			}
+		}
+	})
+}
+
+func calDAVPropertyNames(body []byte) []string {
+	dec := xml.NewDecoder(bytes.NewReader(body))
+	var names []string
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			break
+		}
+		start, ok := tok.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		switch start.Name.Local {
+		case "propertyupdate", "set", "remove", "prop":
+			continue
+		}
+		names = append(names, "{"+start.Name.Space+"}"+start.Name.Local)
+	}
+	return names
+}
+
+var supportedAppleCalendarProperties = map[string]string{
+	"{http://apple.com/ns/ical/}calendar-color": "calendar-color",
+	"{http://apple.com/ns/ical/}calendar-order": "calendar-order",
+}
+
+// handleAppleCalendarProperties accepts macOS Calendar's client-side display
+// metadata. go-webdav 0.7 returns 501 for every PROPPATCH, which makes Calendar
+// show a permanent sync warning even though event synchronization succeeded.
+// Color and order do not affect EAS data, so acknowledging them as dead
+// properties is safe; all other property updates still reach the normal handler.
+func handleAppleCalendarProperties(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "PROPPATCH" || r.URL.Path != caldavCalendarPath || r.Body == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		if err != nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		names := calDAVPropertyNames(body)
+		if len(names) == 0 {
+			next.ServeHTTP(w, r)
+			return
+		}
+		locals := make([]string, 0, len(names))
+		for _, name := range names {
+			local, ok := supportedAppleCalendarProperties[name]
+			if !ok {
+				next.ServeHTTP(w, r)
+				return
+			}
+			locals = append(locals, local)
+		}
+
+		var response strings.Builder
+		response.WriteString(`<?xml version="1.0" encoding="utf-8"?>`)
+		response.WriteString(`<d:multistatus xmlns:d="DAV:" xmlns:a="http://apple.com/ns/ical/"><d:response>`)
+		response.WriteString(`<d:href>` + caldavCalendarPath + `</d:href><d:propstat><d:prop>`)
+		for _, local := range locals {
+			response.WriteString(`<a:` + local + `/>`)
+		}
+		response.WriteString(`</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`)
+
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.WriteHeader(http.StatusMultiStatus)
+		_, _ = io.WriteString(w, response.String())
+	})
 }
 
 func errCalDAVReadOnly(op string) error {

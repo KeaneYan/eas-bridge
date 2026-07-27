@@ -17,7 +17,8 @@ import (
 )
 
 const (
-	asVersion = "14.0"
+	asVersion                  = "14.0"
+	maxCalendarNoProgressPages = 3
 )
 
 // syncEngine 封装 EAS 客户端与同步状态。
@@ -117,6 +118,18 @@ func newSyncEngine(cfg *config) (*syncEngine, error) {
 		if err != nil {
 			return nil, err
 		}
+	}
+	// Some EAS implementations keep returning the same logical events with new
+	// ServerIDs while MoreAvailable remains set. Older versions accumulated every
+	// copy, which could leave tens of thousands of duplicate CalDAV resources and
+	// make desktop calendar clients unusable. Repair exact duplicates eagerly and
+	// compact the shard once so subsequent startups do not replay a huge snapshot.
+	duplicateEventIDs, cleanupErr := repairDuplicateCalendarEventsOnStartup(st)
+	if cleanupErr != nil {
+		return nil, fmt.Errorf("清理重复日历事件: %w", cleanupErr)
+	}
+	if len(duplicateEventIDs) > 0 {
+		log.Printf("[state] 清理 %d 条重复日历事件", len(duplicateEventIDs))
 	}
 	st.mu.Lock()
 	needID := st.DeviceID == ""
@@ -409,9 +422,26 @@ func (e *syncEngine) syncCalendarOnce(ctx context.Context) error {
 	if calFolderID == "" {
 		return fmt.Errorf("服务器没有日历文件夹")
 	}
+	// Directly constructed engines in tests and long-running processes upgraded
+	// in place may not have passed through newSyncEngine's startup repair.
+	e.st.mu.Lock()
+	duplicateEventIDs := dedupeEquivalentCalendarEventsLocked(e.st.Events)
+	var cleanupErr error
+	if len(duplicateEventIDs) > 0 {
+		cleanupErr = e.st.saveCalendarLocked(nil, duplicateEventIDs)
+	}
+	e.st.mu.Unlock()
+	if cleanupErr != nil {
+		return cleanupErr
+	}
+	if len(duplicateEventIDs) > 0 {
+		log.Printf("[sync] 清理 %d 条重复日历事件", len(duplicateEventIDs))
+	}
+
 	retried := false
 	var pendingUpserts []eas.EventItem
 	var pendingDeletes []string
+	noProgressPages := 0
 	for page := 0; page < 100; page++ {
 		res, err := e.c.SyncCalendar(ctx, calFolderID, eas.CalendarSyncOptions{WindowSize: 100})
 		if err != nil {
@@ -424,25 +454,41 @@ func (e *syncEngine) syncCalendarOnce(ctx context.Context) error {
 				retried = true
 				// 清掉重置前累积的批次，避免与全量重拉重复追加（幂等无害但冗余）
 				pendingUpserts, pendingDeletes = nil, nil
+				noProgressPages = 0
 				page = -1
 				continue
 			}
 			return fmt.Errorf("SyncCalendar: %w", err)
 		}
 		e.st.mu.Lock()
+		pageProgress := false
+		duplicateIndex := newCalendarEventDuplicateIndex(e.st.Events)
 		for _, ev := range res.Added {
-			e.st.Events[ev.ServerID] = ev
-			pendingUpserts = append(pendingUpserts, ev)
+			if addCalendarEventLocked(e.st.Events, duplicateIndex, ev) {
+				pendingUpserts = append(pendingUpserts, ev)
+				pageProgress = true
+			}
 		}
 		for _, ev := range res.Changed {
-			e.st.Events[ev.ServerID] = ev
-			pendingUpserts = append(pendingUpserts, ev)
+			if changeCalendarEventLocked(e.st.Events, duplicateIndex, ev) {
+				pendingUpserts = append(pendingUpserts, ev)
+				pageProgress = true
+			}
 		}
 		for _, id := range res.Deleted {
-			delete(e.st.Events, id)
-			pendingDeletes = append(pendingDeletes, id)
+			if _, ok := e.st.Events[id]; ok {
+				delete(e.st.Events, id)
+				pendingDeletes = append(pendingDeletes, id)
+				pageProgress = true
+			}
 		}
-		shouldSave := (page+1)%10 == 0 || !res.MoreAvailable || page == 99
+		if pageProgress {
+			noProgressPages = 0
+		} else {
+			noProgressPages++
+		}
+		stalled := res.MoreAvailable && noProgressPages >= maxCalendarNoProgressPages
+		shouldSave := (page+1)%10 == 0 || !res.MoreAvailable || stalled || page == 99
 		var saveErr error
 		if shouldSave {
 			// 事件变更按批次追加 events.jsonl（与 synckey 落盘同节奏：
@@ -457,8 +503,166 @@ func (e *syncEngine) syncCalendarOnce(ctx context.Context) error {
 		if !res.MoreAvailable {
 			return nil
 		}
+		if stalled {
+			// The EAS client has already accepted this page's SyncKey and
+			// saveCalendarLocked persisted it above. If duplicate-only pages
+			// precede a real change, the next polling pass resumes after these
+			// pages instead of replaying them forever.
+			log.Printf("[sync] 日历连续 %d 页没有逻辑变化，忽略异常的 MoreAvailable 并结束本轮同步", noProgressPages)
+			return nil
+		}
 	}
 	return fmt.Errorf("日历同步超过 100 页仍未完成")
+}
+
+// calendarEventsEquivalent reports whether two server records describe the
+// same logical event. ServerID and UID are intentionally ignored: Coremail has
+// been observed allocating fresh values for both while resending an otherwise
+// byte-identical event.
+func calendarEventsEquivalent(a, b eas.EventItem) bool {
+	a.ServerID = ""
+	a.UID = ""
+	b.ServerID = ""
+	b.UID = ""
+	return reflect.DeepEqual(a, b)
+}
+
+type calendarEventDuplicateKey struct {
+	subject        string
+	location       string
+	body           string
+	start          time.Time
+	end            time.Time
+	allDay         bool
+	organizerEmail string
+}
+
+func calendarDuplicateKey(ev eas.EventItem) calendarEventDuplicateKey {
+	return calendarEventDuplicateKey{
+		subject:        ev.Subject,
+		location:       ev.Location,
+		body:           ev.Body,
+		start:          ev.StartTime,
+		end:            ev.EndTime,
+		allDay:         ev.AllDayEvent,
+		organizerEmail: ev.OrganizerEmail,
+	}
+}
+
+type calendarEventDuplicateIndex map[calendarEventDuplicateKey]map[string]eas.EventItem
+
+func newCalendarEventDuplicateIndex(events map[string]eas.EventItem) calendarEventDuplicateIndex {
+	index := make(calendarEventDuplicateIndex)
+	for id, ev := range events {
+		index.add(id, ev)
+	}
+	return index
+}
+
+func (index calendarEventDuplicateIndex) hasEquivalent(ev eas.EventItem) bool {
+	for _, existing := range index[calendarDuplicateKey(ev)] {
+		if calendarEventsEquivalent(existing, ev) {
+			return true
+		}
+	}
+	return false
+}
+
+func (index calendarEventDuplicateIndex) add(id string, ev eas.EventItem) {
+	key := calendarDuplicateKey(ev)
+	if index[key] == nil {
+		index[key] = make(map[string]eas.EventItem)
+	}
+	index[key][id] = ev
+}
+
+func (index calendarEventDuplicateIndex) remove(id string, ev eas.EventItem) {
+	key := calendarDuplicateKey(ev)
+	delete(index[key], id)
+	if len(index[key]) == 0 {
+		delete(index, key)
+	}
+}
+
+// dedupeEquivalentCalendarEventsLocked removes exact semantic duplicates even
+// when the server changed both ServerID and UID. The coarse comparable key keeps
+// matching linear for the common case; calendarEventsEquivalent then verifies
+// every remaining field (attendees, recurrence, status, timezone, and so on).
+// Different variants are retained. IDs are sorted first so the surviving CalDAV
+// resource path is deterministic.
+func dedupeEquivalentCalendarEventsLocked(events map[string]eas.EventItem) []string {
+	ids := make([]string, 0, len(events))
+	for id := range events {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	representatives := make(calendarEventDuplicateIndex)
+	var duplicates []string
+	for _, id := range ids {
+		ev := events[id]
+		if representatives.hasEquivalent(ev) {
+			delete(events, id)
+			duplicates = append(duplicates, id)
+			continue
+		}
+		representatives.add(id, ev)
+	}
+	return duplicates
+}
+
+// repairDuplicateCalendarEventsOnStartup compacts the repaired event map before
+// startup proceeds. Returning either snapshot or main-state write errors is
+// essential: otherwise duplicates removed only from memory reappear on restart.
+func repairDuplicateCalendarEventsOnStartup(st *diskState) ([]string, error) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	duplicateEventIDs := dedupeEquivalentCalendarEventsLocked(st.Events)
+	if len(duplicateEventIDs) == 0 {
+		return nil, nil
+	}
+	if err := st.writeEventsSnapshotLocked(); err != nil {
+		return nil, err
+	}
+	if err := st.saveMainLocked(); err != nil {
+		return nil, err
+	}
+	return duplicateEventIDs, nil
+}
+
+// addCalendarEventLocked applies EAS Add semantics. Cross-ServerID equivalence
+// suppresses Coremail's duplicate resources only when this ServerID is new.
+func addCalendarEventLocked(events map[string]eas.EventItem, index calendarEventDuplicateIndex, ev eas.EventItem) bool {
+	if existing, ok := events[ev.ServerID]; ok {
+		if calendarEventsEquivalent(existing, ev) {
+			return false
+		}
+		index.remove(ev.ServerID, existing)
+		events[ev.ServerID] = ev
+		index.add(ev.ServerID, ev)
+		return true
+	}
+	if index.hasEquivalent(ev) {
+		return false
+	}
+	events[ev.ServerID] = ev
+	index.add(ev.ServerID, ev)
+	return true
+}
+
+// changeCalendarEventLocked always applies a real Changed record to its own
+// ServerID. It must not be rejected merely because its new contents match a
+// different event; the server has already advanced the SyncKey for this change.
+func changeCalendarEventLocked(events map[string]eas.EventItem, index calendarEventDuplicateIndex, ev eas.EventItem) bool {
+	if existing, ok := events[ev.ServerID]; ok {
+		if calendarEventsEquivalent(existing, ev) {
+			return false
+		}
+		index.remove(ev.ServerID, existing)
+	}
+	events[ev.ServerID] = ev
+	index.add(ev.ServerID, ev)
+	return true
 }
 
 // mailFolderIDs 返回当前所有可同步邮件文件夹的 ServerID（每轮重新读，新文件夹自动纳入）。
