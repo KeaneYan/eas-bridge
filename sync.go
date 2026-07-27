@@ -124,16 +124,9 @@ func newSyncEngine(cfg *config) (*syncEngine, error) {
 	// copy, which could leave tens of thousands of duplicate CalDAV resources and
 	// make desktop calendar clients unusable. Repair exact duplicates eagerly and
 	// compact the shard once so subsequent startups do not replay a huge snapshot.
-	st.mu.Lock()
-	duplicateEventIDs := dedupeEquivalentCalendarEventsLocked(st.Events)
-	if len(duplicateEventIDs) > 0 {
-		if err := st.writeEventsSnapshotLocked(); err == nil {
-			err = st.saveMainLocked()
-		}
-	}
-	st.mu.Unlock()
-	if err != nil {
-		return nil, fmt.Errorf("清理重复日历事件: %w", err)
+	duplicateEventIDs, cleanupErr := repairDuplicateCalendarEventsOnStartup(st)
+	if cleanupErr != nil {
+		return nil, fmt.Errorf("清理重复日历事件: %w", cleanupErr)
 	}
 	if len(duplicateEventIDs) > 0 {
 		log.Printf("[state] 清理 %d 条重复日历事件", len(duplicateEventIDs))
@@ -469,14 +462,15 @@ func (e *syncEngine) syncCalendarOnce(ctx context.Context) error {
 		}
 		e.st.mu.Lock()
 		pageProgress := false
+		duplicateIndex := newCalendarEventDuplicateIndex(e.st.Events)
 		for _, ev := range res.Added {
-			if upsertCalendarEventLocked(e.st.Events, ev) {
+			if addCalendarEventLocked(e.st.Events, duplicateIndex, ev) {
 				pendingUpserts = append(pendingUpserts, ev)
 				pageProgress = true
 			}
 		}
 		for _, ev := range res.Changed {
-			if upsertCalendarEventLocked(e.st.Events, ev) {
+			if changeCalendarEventLocked(e.st.Events, duplicateIndex, ev) {
 				pendingUpserts = append(pendingUpserts, ev)
 				pageProgress = true
 			}
@@ -510,6 +504,10 @@ func (e *syncEngine) syncCalendarOnce(ctx context.Context) error {
 			return nil
 		}
 		if stalled {
+			// The EAS client has already accepted this page's SyncKey and
+			// saveCalendarLocked persisted it above. If duplicate-only pages
+			// precede a real change, the next polling pass resumes after these
+			// pages instead of replaying them forever.
 			log.Printf("[sync] 日历连续 %d 页没有逻辑变化，忽略异常的 MoreAvailable 并结束本轮同步", noProgressPages)
 			return nil
 		}
@@ -551,6 +549,41 @@ func calendarDuplicateKey(ev eas.EventItem) calendarEventDuplicateKey {
 	}
 }
 
+type calendarEventDuplicateIndex map[calendarEventDuplicateKey]map[string]eas.EventItem
+
+func newCalendarEventDuplicateIndex(events map[string]eas.EventItem) calendarEventDuplicateIndex {
+	index := make(calendarEventDuplicateIndex)
+	for id, ev := range events {
+		index.add(id, ev)
+	}
+	return index
+}
+
+func (index calendarEventDuplicateIndex) hasEquivalent(ev eas.EventItem) bool {
+	for _, existing := range index[calendarDuplicateKey(ev)] {
+		if calendarEventsEquivalent(existing, ev) {
+			return true
+		}
+	}
+	return false
+}
+
+func (index calendarEventDuplicateIndex) add(id string, ev eas.EventItem) {
+	key := calendarDuplicateKey(ev)
+	if index[key] == nil {
+		index[key] = make(map[string]eas.EventItem)
+	}
+	index[key][id] = ev
+}
+
+func (index calendarEventDuplicateIndex) remove(id string, ev eas.EventItem) {
+	key := calendarDuplicateKey(ev)
+	delete(index[key], id)
+	if len(index[key]) == 0 {
+		delete(index, key)
+	}
+}
+
 // dedupeEquivalentCalendarEventsLocked removes exact semantic duplicates even
 // when the server changed both ServerID and UID. The coarse comparable key keeps
 // matching linear for the common case; calendarEventsEquivalent then verifies
@@ -564,41 +597,71 @@ func dedupeEquivalentCalendarEventsLocked(events map[string]eas.EventItem) []str
 	}
 	sort.Strings(ids)
 
-	representatives := make(map[calendarEventDuplicateKey][]eas.EventItem)
+	representatives := make(calendarEventDuplicateIndex)
 	var duplicates []string
 	for _, id := range ids {
 		ev := events[id]
-		key := calendarDuplicateKey(ev)
-		isDuplicate := false
-		for _, prior := range representatives[key] {
-			if calendarEventsEquivalent(prior, ev) {
-				isDuplicate = true
-				break
-			}
-		}
-		if isDuplicate {
+		if representatives.hasEquivalent(ev) {
 			delete(events, id)
 			duplicates = append(duplicates, id)
 			continue
 		}
-		representatives[key] = append(representatives[key], ev)
+		representatives.add(id, ev)
 	}
 	return duplicates
 }
 
-// upsertCalendarEventLocked stores a server change only when it adds or changes
-// logical data. Identical content with a different UID and/or ServerID is ignored
-// to keep the cache and CalDAV resource set stable.
-func upsertCalendarEventLocked(events map[string]eas.EventItem, ev eas.EventItem) bool {
-	if existing, ok := events[ev.ServerID]; ok && calendarEventsEquivalent(existing, ev) {
-		return false
+// repairDuplicateCalendarEventsOnStartup compacts the repaired event map before
+// startup proceeds. Returning either snapshot or main-state write errors is
+// essential: otherwise duplicates removed only from memory reappear on restart.
+func repairDuplicateCalendarEventsOnStartup(st *diskState) ([]string, error) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	duplicateEventIDs := dedupeEquivalentCalendarEventsLocked(st.Events)
+	if len(duplicateEventIDs) == 0 {
+		return nil, nil
 	}
-	for _, existing := range events {
+	if err := st.writeEventsSnapshotLocked(); err != nil {
+		return nil, err
+	}
+	if err := st.saveMainLocked(); err != nil {
+		return nil, err
+	}
+	return duplicateEventIDs, nil
+}
+
+// addCalendarEventLocked applies EAS Add semantics. Cross-ServerID equivalence
+// suppresses Coremail's duplicate resources only when this ServerID is new.
+func addCalendarEventLocked(events map[string]eas.EventItem, index calendarEventDuplicateIndex, ev eas.EventItem) bool {
+	if existing, ok := events[ev.ServerID]; ok {
 		if calendarEventsEquivalent(existing, ev) {
 			return false
 		}
+		index.remove(ev.ServerID, existing)
+		events[ev.ServerID] = ev
+		index.add(ev.ServerID, ev)
+		return true
+	}
+	if index.hasEquivalent(ev) {
+		return false
 	}
 	events[ev.ServerID] = ev
+	index.add(ev.ServerID, ev)
+	return true
+}
+
+// changeCalendarEventLocked always applies a real Changed record to its own
+// ServerID. It must not be rejected merely because its new contents match a
+// different event; the server has already advanced the SyncKey for this change.
+func changeCalendarEventLocked(events map[string]eas.EventItem, index calendarEventDuplicateIndex, ev eas.EventItem) bool {
+	if existing, ok := events[ev.ServerID]; ok {
+		if calendarEventsEquivalent(existing, ev) {
+			return false
+		}
+		index.remove(ev.ServerID, existing)
+	}
+	events[ev.ServerID] = ev
+	index.add(ev.ServerID, ev)
 	return true
 }
 

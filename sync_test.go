@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -273,6 +274,81 @@ func TestDedupeEquivalentCalendarEventsKeepsVariants(t *testing.T) {
 	}
 }
 
+func TestRepairDuplicateCalendarEventsOnStartupPropagatesWriteErrors(t *testing.T) {
+	newStateWithDuplicate := func(t *testing.T) *diskState {
+		t.Helper()
+		st := mustLoadTestState(t)
+		event := eas.EventItem{ServerID: "Event:1", UID: "uid-1", Subject: "duplicate"}
+		duplicate := event
+		duplicate.ServerID = "Event:2"
+		duplicate.UID = "uid-2"
+		st.Events[event.ServerID] = event
+		st.Events[duplicate.ServerID] = duplicate
+		return st
+	}
+
+	t.Run("snapshot", func(t *testing.T) {
+		st := newStateWithDuplicate(t)
+		notDirectory := filepath.Join(t.TempDir(), "not-a-directory")
+		if err := os.WriteFile(notDirectory, []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		st.dir = notDirectory
+		if _, err := repairDuplicateCalendarEventsOnStartup(st); err == nil {
+			t.Fatal("events.json 快照写失败必须返回错误")
+		}
+	})
+
+	t.Run("main state", func(t *testing.T) {
+		st := newStateWithDuplicate(t)
+		notDirectory := filepath.Join(t.TempDir(), "not-a-directory")
+		if err := os.WriteFile(notDirectory, []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		st.path = filepath.Join(notDirectory, "state.json")
+		if _, err := repairDuplicateCalendarEventsOnStartup(st); err == nil {
+			t.Fatal("state.json 写失败必须返回错误")
+		}
+	})
+}
+
+func TestChangedCalendarEventIsNotDroppedWhenItMatchesAnotherEvent(t *testing.T) {
+	start := time.Date(2026, time.July, 27, 14, 0, 0, 0, time.UTC)
+	oldA := eas.EventItem{
+		ServerID:  "Event:A",
+		UID:       "uid-a",
+		Subject:   "old subject",
+		StartTime: start,
+		EndTime:   start.Add(time.Hour),
+	}
+	eventB := oldA
+	eventB.ServerID = "Event:B"
+	eventB.UID = "uid-b"
+	eventB.Subject = "new subject"
+	changedA := eventB
+	changedA.ServerID = oldA.ServerID
+	changedA.UID = oldA.UID
+
+	events := map[string]eas.EventItem{
+		oldA.ServerID:   oldA,
+		eventB.ServerID: eventB,
+	}
+	index := newCalendarEventDuplicateIndex(events)
+	if !changeCalendarEventLocked(events, index, changedA) {
+		t.Fatal("Changed 事件的新内容与另一事件相同，也必须覆盖自己的 ServerID")
+	}
+	if got := events[oldA.ServerID].Subject; got != "new subject" {
+		t.Fatalf("Event:A subject = %q, want new subject", got)
+	}
+
+	duplicateAdd := changedA
+	duplicateAdd.ServerID = "Event:C"
+	duplicateAdd.UID = "uid-c"
+	if addCalendarEventLocked(events, index, duplicateAdd) {
+		t.Fatal("Add 路径仍应抑制跨 ServerID 的等价重复事件")
+	}
+}
+
 func TestSyncCalendarStopsAfterDuplicateOnlyPages(t *testing.T) {
 	st := mustLoadTestState(t)
 	st.Folders = []eas.Folder{{ServerID: "calendar", Type: eas.FolderTypeCalendar}}
@@ -315,6 +391,65 @@ func TestSyncCalendarStopsAfterDuplicateOnlyPages(t *testing.T) {
 	}
 	if _, ok := st.Events[existing.ServerID]; !ok {
 		t.Fatal("stable original event was replaced by a duplicate ServerID")
+	}
+}
+
+func TestSyncCalendarResumesAfterDuplicateOnlyPages(t *testing.T) {
+	st := mustLoadTestState(t)
+	st.Folders = []eas.Folder{{ServerID: "calendar", Type: eas.FolderTypeCalendar}}
+	start := time.Date(2026, time.July, 27, 9, 0, 0, 0, time.UTC)
+	existing := eas.EventItem{
+		ServerID:  "Event:original",
+		UID:       "stable-uid",
+		Subject:   "Standup",
+		StartTime: start,
+		EndTime:   start.Add(30 * time.Minute),
+	}
+	realEvent := eas.EventItem{
+		ServerID:  "Event:real",
+		UID:       "real-uid",
+		Subject:   "Planning",
+		StartTime: start.Add(2 * time.Hour),
+		EndTime:   start.Add(3 * time.Hour),
+	}
+	st.Events[existing.ServerID] = existing
+
+	calls := 0
+	engine := &syncEngine{
+		st: st,
+		c: &easmock.Client{
+			CalendarClient: easmock.CalendarClient{
+				SyncCalendarFunc: func(context.Context, string, eas.CalendarSyncOptions) (*eas.CalendarSyncResult, error) {
+					calls++
+					if calls <= maxCalendarNoProgressPages {
+						duplicate := existing
+						duplicate.ServerID = fmt.Sprintf("Event:duplicate:%d", calls)
+						duplicate.UID = fmt.Sprintf("server-rotated-uid:%d", calls)
+						return &eas.CalendarSyncResult{
+							MoreAvailable: true,
+							Added:         []eas.EventItem{duplicate},
+						}, nil
+					}
+					return &eas.CalendarSyncResult{Added: []eas.EventItem{realEvent}}, nil
+				},
+			},
+		},
+	}
+
+	if err := engine.syncCalendarOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st.Events[realEvent.ServerID]; ok {
+		t.Fatal("第一轮应在重复页阈值处结束，尚未读取后续真实事件")
+	}
+	if err := engine.syncCalendarOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st.Events[realEvent.ServerID]; !ok {
+		t.Fatal("下一轮未从重复页之后恢复并读取真实事件")
+	}
+	if calls != maxCalendarNoProgressPages+1 {
+		t.Fatalf("SyncCalendar calls = %d, want %d", calls, maxCalendarNoProgressPages+1)
 	}
 }
 
