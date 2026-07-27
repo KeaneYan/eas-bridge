@@ -72,6 +72,7 @@ type eventsShard struct {
 type calendarEventAlias struct {
 	CanonicalID string `json:"canonical_id"`
 	UID         string `json:"uid,omitempty"`
+	Replay      bool   `json:"replay,omitempty"`
 }
 
 // diskState 是进程内唯一的 EAS 同步状态 + IMAP UID 映射。
@@ -237,10 +238,18 @@ func (s *diskState) normalize() {
 		s.EventAliases = map[string]calendarEventAlias{}
 	}
 	for serverID, alias := range s.EventAliases {
-		_, targetExists := s.Events[alias.CanonicalID]
+		target, targetExists := s.Events[alias.CanonicalID]
 		_, isVisible := s.Events[serverID]
 		if serverID == "" || alias.CanonicalID == "" || serverID == alias.CanonicalID || isVisible || !targetExists {
 			delete(s.EventAliases, serverID)
+			continue
+		}
+		// Aliases written by the first PR revision did not persist their source.
+		// Different UIDs could only have been folded by replay detection, so this
+		// reconstructs the marker and allows the rolling-window cleanup below.
+		if !alias.Replay && alias.UID != "" && alias.UID != target.UID {
+			alias.Replay = true
+			s.EventAliases[serverID] = alias
 		}
 	}
 	if s.Deleted == nil {

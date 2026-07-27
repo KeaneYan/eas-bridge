@@ -457,6 +457,54 @@ func TestCalendarAliasLifecycle(t *testing.T) {
 	})
 }
 
+func TestCalendarReplayAliasesUseRollingPage(t *testing.T) {
+	start := time.Date(2026, time.July, 27, 9, 0, 0, 0, time.UTC)
+	canonical := eas.EventItem{
+		ServerID:  "Event:canonical",
+		UID:       "stable-uid",
+		Subject:   "Standup",
+		StartTime: start,
+		EndTime:   start.Add(30 * time.Minute),
+	}
+	events := map[string]eas.EventItem{canonical.ServerID: canonical}
+	aliases := map[string]calendarEventAlias{
+		"Event:old-replay": {
+			CanonicalID: canonical.ServerID,
+			UID:         "rotated-old",
+			Replay:      true,
+		},
+		"Event:stable-alias": {
+			CanonicalID: canonical.ServerID,
+			UID:         canonical.UID,
+		},
+	}
+	newReplay := canonical
+	newReplay.ServerID = "Event:new-replay"
+	newReplay.UID = "rotated-new"
+	index := newCalendarEventDuplicateIndex(events)
+	var changes calendarMutations
+
+	pruneCalendarReplayAliasesLocked(
+		events,
+		aliases,
+		index,
+		[]eas.EventItem{newReplay},
+		&changes,
+	)
+	if _, ok := aliases["Event:old-replay"]; ok {
+		t.Fatal("historical replay alias was not pruned")
+	}
+	if _, ok := aliases["Event:stable-alias"]; !ok {
+		t.Fatal("same-UID stable alias must survive replay pruning")
+	}
+	if addCalendarEventLocked(events, aliases, index, newReplay, true, &changes) {
+		t.Fatal("new replay ID should remain hidden")
+	}
+	if alias := aliases[newReplay.ServerID]; !alias.Replay || alias.CanonicalID != canonical.ServerID {
+		t.Fatalf("new replay alias = %+v", alias)
+	}
+}
+
 func TestSyncCalendarStopsAfterDuplicateOnlyPages(t *testing.T) {
 	st := mustLoadTestState(t)
 	st.Folders = []eas.Folder{{ServerID: "calendar", Type: eas.FolderTypeCalendar}}
@@ -515,7 +563,7 @@ func TestSyncCalendarStopsAfterDuplicateOnlyPages(t *testing.T) {
 	if _, ok := st.Events[existing.ServerID]; !ok {
 		t.Fatal("stable original event was replaced by a duplicate ServerID")
 	}
-	wantAliases := 2 * maxCalendarNoProgressPages
+	wantAliases := 2
 	if len(st.EventAliases) != wantAliases {
 		t.Fatalf("aliases = %d, want %d", len(st.EventAliases), wantAliases)
 	}
@@ -621,7 +669,7 @@ func TestSyncCalendarResumesAfterDuplicateOnlyPages(t *testing.T) {
 	if got := reloaded.SyncKeys["calendar"]; got != "k3" {
 		t.Fatalf("stalled batch persisted SyncKey = %q, want k3", got)
 	}
-	wantAliases := 2 * maxCalendarNoProgressPages
+	wantAliases := 2
 	if len(reloaded.EventAliases) != wantAliases {
 		t.Fatalf("persisted aliases = %d, want %d", len(reloaded.EventAliases), wantAliases)
 	}

@@ -192,7 +192,7 @@ func TestCalendarAliasPersistsThroughLogAndSnapshot(t *testing.T) {
 	}
 
 	st.mu.Lock()
-	alias := calendarEventAlias{CanonicalID: canonical.ServerID, UID: "rotated-uid"}
+	alias := calendarEventAlias{CanonicalID: canonical.ServerID, UID: canonical.UID}
 	st.EventAliases["ev2"] = alias
 	var changes calendarMutations
 	changes.recordAlias("ev2", alias)

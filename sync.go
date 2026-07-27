@@ -471,6 +471,15 @@ func (e *syncEngine) syncCalendarOnce(ctx context.Context) error {
 		pageProgress := false
 		duplicateIndex := newCalendarEventDuplicateIndex(e.st.Events)
 		duplicateReplay := calendarPageIsDuplicateReplay(res, e.st.Events, e.st.EventAliases, duplicateIndex)
+		if duplicateReplay {
+			pruneCalendarReplayAliasesLocked(
+				e.st.Events,
+				e.st.EventAliases,
+				duplicateIndex,
+				res.Added,
+				&pending,
+			)
+		}
 		for _, ev := range res.Added {
 			if addCalendarEventLocked(e.st.Events, e.st.EventAliases, duplicateIndex, ev, duplicateReplay, &pending) {
 				pageProgress = true
@@ -688,6 +697,44 @@ func calendarPageIsDuplicateReplay(
 	return true
 }
 
+// pruneCalendarReplayAliasesLocked keeps only the replay IDs present on the
+// current duplicate page for each affected canonical event. Coremail can mint
+// fresh IDs forever; retaining every historical replay ID would merely replace
+// full-event cache bloat with unbounded alias bloat.
+func pruneCalendarReplayAliasesLocked(
+	events map[string]eas.EventItem,
+	aliases map[string]calendarEventAlias,
+	index calendarEventDuplicateIndex,
+	added []eas.EventItem,
+	changes *calendarMutations,
+) {
+	keep := map[string]map[string]struct{}{}
+	for _, ev := range added {
+		_, canonicalID, ok := canonicalCalendarEvent(events, aliases, ev.ServerID)
+		if !ok {
+			canonicalID, ok = index.findEquivalent(ev, true)
+		}
+		if !ok {
+			continue
+		}
+		if keep[canonicalID] == nil {
+			keep[canonicalID] = map[string]struct{}{}
+		}
+		keep[canonicalID][ev.ServerID] = struct{}{}
+	}
+	for aliasID, alias := range aliases {
+		currentIDs, touched := keep[alias.CanonicalID]
+		if !alias.Replay || !touched {
+			continue
+		}
+		if _, current := currentIDs[aliasID]; current {
+			continue
+		}
+		delete(aliases, aliasID)
+		changes.recordAliasDelete(aliasID)
+	}
+}
+
 // addCalendarEventLocked applies EAS Add semantics. A new ServerID is folded
 // only when it shares a stable UID or belongs to a page-level replay. The alias
 // preserves the remote identity for future incremental Change/Delete commands.
@@ -727,14 +774,16 @@ func addCalendarEventLocked(
 
 	var canonicalID string
 	var equivalent bool
+	replayAlias := false
 	if ev.UID != "" {
 		canonicalID, equivalent = index.findEquivalent(ev, false)
 	}
 	if !equivalent && duplicateReplay {
 		canonicalID, equivalent = index.findEquivalent(ev, true)
+		replayAlias = equivalent
 	}
 	if equivalent {
-		alias := calendarEventAlias{CanonicalID: canonicalID, UID: ev.UID}
+		alias := calendarEventAlias{CanonicalID: canonicalID, UID: ev.UID, Replay: replayAlias}
 		aliases[ev.ServerID] = alias
 		changes.recordAlias(ev.ServerID, alias)
 		return false
