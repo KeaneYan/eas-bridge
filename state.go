@@ -63,7 +63,15 @@ type folderShard struct {
 
 // eventsShard 日历事件分片。
 type eventsShard struct {
-	Events map[string]eas.EventItem `json:"events"`
+	Events  map[string]eas.EventItem      `json:"events"`
+	Aliases map[string]calendarEventAlias `json:"aliases,omitempty"`
+}
+
+// calendarEventAlias keeps a suppressed remote ServerID addressable for later
+// EAS Change/Delete commands without duplicating the full event body on disk.
+type calendarEventAlias struct {
+	CanonicalID string `json:"canonical_id"`
+	UID         string `json:"uid,omitempty"`
 }
 
 // diskState 是进程内唯一的 EAS 同步状态 + IMAP UID 映射。
@@ -81,19 +89,21 @@ type diskState struct {
 	UIDs         map[string][]uidEntry      // folderID → UID 映射（按 UID 升序）
 	FolderMeta   map[string]folderMeta      // folderID → UID 管理元数据
 	Events       map[string]eas.EventItem   // 日历事件缓存 serverID→event
+	EventAliases map[string]calendarEventAlias
 	Deleted      map[string]map[string]bool // folderID → serverID → 已标记 \Deleted
 }
 
 func loadState(path string) (*diskState, error) {
 	s := &diskState{
-		path:       path,
-		dir:        filepath.Dir(path),
-		SyncKeys:   map[string]string{},
-		Items:      map[string][]eas.EmailItem{},
-		UIDs:       map[string][]uidEntry{},
-		FolderMeta: map[string]folderMeta{},
-		Events:     map[string]eas.EventItem{},
-		Deleted:    map[string]map[string]bool{},
+		path:         path,
+		dir:          filepath.Dir(path),
+		SyncKeys:     map[string]string{},
+		Items:        map[string][]eas.EmailItem{},
+		UIDs:         map[string][]uidEntry{},
+		FolderMeta:   map[string]folderMeta{},
+		Events:       map[string]eas.EventItem{},
+		EventAliases: map[string]calendarEventAlias{},
+		Deleted:      map[string]map[string]bool{},
 	}
 	if err := os.MkdirAll(filepath.Join(s.dir, "folders"), 0700); err != nil {
 		return nil, err
@@ -165,6 +175,9 @@ func loadState(path string) (*diskState, error) {
 		var es eventsShard
 		if json.Unmarshal(data, &es) == nil && es.Events != nil {
 			s.Events = es.Events
+			if es.Aliases != nil {
+				s.EventAliases = es.Aliases
+			}
 		}
 	}
 	if err := s.replayEventLogLocked(); err != nil {
@@ -219,6 +232,16 @@ func (s *diskState) normalize() {
 	}
 	if s.Events == nil {
 		s.Events = map[string]eas.EventItem{}
+	}
+	if s.EventAliases == nil {
+		s.EventAliases = map[string]calendarEventAlias{}
+	}
+	for serverID, alias := range s.EventAliases {
+		_, targetExists := s.Events[alias.CanonicalID]
+		_, isVisible := s.Events[serverID]
+		if serverID == "" || alias.CanonicalID == "" || serverID == alias.CanonicalID || isVisible || !targetExists {
+			delete(s.EventAliases, serverID)
+		}
 	}
 	if s.Deleted == nil {
 		s.Deleted = map[string]map[string]bool{}
@@ -279,7 +302,7 @@ func (s *diskState) saveFolderLocked(folderID string) error {
 // 崩溃在两者之间 = 旧日志被多放一遍，结果相同）。截断失败只记日志。
 // 调用方须已持 s.mu（或 loadState 单线程阶段）。
 func (s *diskState) writeEventsSnapshotLocked() error {
-	b, err := json.Marshal(eventsShard{Events: s.Events})
+	b, err := json.Marshal(eventsShard{Events: s.Events, Aliases: s.EventAliases})
 	if err != nil {
 		return err
 	}
@@ -618,10 +641,73 @@ func (s *diskState) saveNow() error {
 // 设为 var 以便测试调小。
 var eventLogCompactThreshold = int64(16 << 20) // 16MB
 
-// eventLogEntry 是 events.jsonl 的一行：一次事件 upsert 或 delete。
+type calendarAliasLogEntry struct {
+	ServerID string             `json:"server_id"`
+	Alias    calendarEventAlias `json:"alias"`
+}
+
+type calendarMutationLog struct {
+	Upserts       []eas.EventItem         `json:"upserts,omitempty"`
+	Deletes       []string                `json:"deletes,omitempty"`
+	Aliases       []calendarAliasLogEntry `json:"aliases,omitempty"`
+	DeleteAliases []string                `json:"delete_aliases,omitempty"`
+}
+
+// eventLogEntry 是 events.jsonl 的一行。旧版单操作字段仅用于向后兼容；
+// 新写入统一使用 Batch，保证一个同步批次在崩溃恢复时不可分割。
 type eventLogEntry struct {
-	Upsert *eas.EventItem `json:"upsert,omitempty"`
-	Delete string         `json:"delete,omitempty"`
+	Upsert      *eas.EventItem         `json:"upsert,omitempty"`
+	Delete      string                 `json:"delete,omitempty"`
+	Alias       *calendarAliasLogEntry `json:"alias,omitempty"`
+	DeleteAlias string                 `json:"delete_alias,omitempty"`
+	Batch       *calendarMutationLog   `json:"batch,omitempty"`
+}
+
+// calendarMutations coalesces multiple sync pages before they are appended to
+// events.jsonl. Recording only the final mutation per ServerID avoids replay
+// order bugs when an alias is created and removed within the same batch.
+type calendarMutations struct {
+	upserts      map[string]eas.EventItem
+	deletes      map[string]struct{}
+	aliasUpserts map[string]calendarEventAlias
+	aliasDeletes map[string]struct{}
+}
+
+func (m *calendarMutations) recordUpsert(ev eas.EventItem) {
+	if m.upserts == nil {
+		m.upserts = map[string]eas.EventItem{}
+	}
+	delete(m.deletes, ev.ServerID)
+	m.upserts[ev.ServerID] = ev
+}
+
+func (m *calendarMutations) recordDelete(serverID string) {
+	if m.deletes == nil {
+		m.deletes = map[string]struct{}{}
+	}
+	delete(m.upserts, serverID)
+	m.deletes[serverID] = struct{}{}
+}
+
+func (m *calendarMutations) recordAlias(serverID string, alias calendarEventAlias) {
+	if m.aliasUpserts == nil {
+		m.aliasUpserts = map[string]calendarEventAlias{}
+	}
+	delete(m.aliasDeletes, serverID)
+	m.aliasUpserts[serverID] = alias
+}
+
+func (m *calendarMutations) recordAliasDelete(serverID string) {
+	if m.aliasDeletes == nil {
+		m.aliasDeletes = map[string]struct{}{}
+	}
+	delete(m.aliasUpserts, serverID)
+	m.aliasDeletes[serverID] = struct{}{}
+}
+
+func (m calendarMutations) empty() bool {
+	return len(m.upserts) == 0 && len(m.deletes) == 0 &&
+		len(m.aliasUpserts) == 0 && len(m.aliasDeletes) == 0
 }
 
 func (s *diskState) eventLogPath() string { return filepath.Join(s.dir, "events.jsonl") }
@@ -631,7 +717,10 @@ func (s *diskState) eventLogPath() string { return filepath.Join(s.dir, "events.
 // 变更未被确认，而主文件 synckey 在同批次靠后落盘，崩溃窗口内 key 也未推进，
 // 下次同步会重新拿到这些事件（与改造前"全量写 events.json → 写主文件"的窗口一致）。
 // 调用方须已持 s.mu。
-func (s *diskState) appendEventLogLocked(upserts []eas.EventItem, deletes []string) error {
+func (s *diskState) appendEventLogLocked(changes calendarMutations) error {
+	if changes.empty() {
+		return nil
+	}
 	f, err := os.OpenFile(s.eventLogPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		return err
@@ -648,20 +737,56 @@ func (s *diskState) appendEventLogLocked(upserts []eas.EventItem, deletes []stri
 		}
 		return w.WriteByte('\n')
 	}
-	for i := range upserts {
-		if err := writeLine(eventLogEntry{Upsert: &upserts[i]}); err != nil {
-			return err
-		}
+
+	batch := &calendarMutationLog{
+		Deletes:       sortedStringSet(changes.deletes),
+		DeleteAliases: sortedStringSet(changes.aliasDeletes),
 	}
-	for _, id := range deletes {
-		if err := writeLine(eventLogEntry{Delete: id}); err != nil {
-			return err
-		}
+	for _, id := range sortedEventIDs(changes.upserts) {
+		batch.Upserts = append(batch.Upserts, changes.upserts[id])
+	}
+	for _, id := range sortedAliasIDs(changes.aliasUpserts) {
+		batch.Aliases = append(batch.Aliases, calendarAliasLogEntry{
+			ServerID: id,
+			Alias:    changes.aliasUpserts[id],
+		})
+	}
+	// One batch occupies one JSONL line. A crash can truncate only the tail line,
+	// so canonical promotion and alias retargeting are replayed all-or-nothing.
+	if err := writeLine(eventLogEntry{Batch: batch}); err != nil {
+		return err
 	}
 	if err := w.Flush(); err != nil {
 		return err
 	}
 	return f.Sync()
+}
+
+func sortedStringSet(values map[string]struct{}) []string {
+	ids := make([]string, 0, len(values))
+	for id := range values {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func sortedEventIDs(values map[string]eas.EventItem) []string {
+	ids := make([]string, 0, len(values))
+	for id := range values {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func sortedAliasIDs(values map[string]calendarEventAlias) []string {
+	ids := make([]string, 0, len(values))
+	for id := range values {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 // replayEventLogLocked 重放 events.jsonl 到内存 map（幂等：按 serverID 覆盖/删除）。
@@ -682,10 +807,31 @@ func (s *diskState) replayEventLogLocked() error {
 		if json.Unmarshal(line, &ent) != nil {
 			continue // 崩溃截断的尾行
 		}
-		if ent.Upsert != nil {
+		if ent.Batch != nil {
+			for _, id := range ent.Batch.Deletes {
+				delete(s.Events, id)
+			}
+			for _, id := range ent.Batch.DeleteAliases {
+				delete(s.EventAliases, id)
+			}
+			for _, ev := range ent.Batch.Upserts {
+				s.Events[ev.ServerID] = ev
+				delete(s.EventAliases, ev.ServerID)
+			}
+			for _, entry := range ent.Batch.Aliases {
+				delete(s.Events, entry.ServerID)
+				s.EventAliases[entry.ServerID] = entry.Alias
+			}
+		} else if ent.Upsert != nil {
 			s.Events[ent.Upsert.ServerID] = *ent.Upsert
+			delete(s.EventAliases, ent.Upsert.ServerID)
 		} else if ent.Delete != "" {
 			delete(s.Events, ent.Delete)
+		} else if ent.Alias != nil {
+			delete(s.Events, ent.Alias.ServerID)
+			s.EventAliases[ent.Alias.ServerID] = ent.Alias.Alias
+		} else if ent.DeleteAlias != "" {
+			delete(s.EventAliases, ent.DeleteAlias)
 		}
 	}
 	return nil
@@ -705,8 +851,8 @@ func (s *diskState) compactEventLogIfNeeded() {
 
 // saveCalendarLocked 日历同步批次落盘：事件变更追加 events.jsonl + 主文件（synckey）。
 // 调用方须已持 s.mu（供 syncCalendarOnce 在锁内调用）。
-func (s *diskState) saveCalendarLocked(upserts []eas.EventItem, deletes []string) error {
-	if err := s.appendEventLogLocked(upserts, deletes); err != nil {
+func (s *diskState) saveCalendarLocked(changes calendarMutations) error {
+	if err := s.appendEventLogLocked(changes); err != nil {
 		return err
 	}
 	return s.saveMainLocked()
@@ -720,7 +866,11 @@ func (s *diskState) upsertEvent(ev eas.EventItem) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Events[ev.ServerID] = ev
-	if err := s.appendEventLogLocked([]eas.EventItem{ev}, nil); err != nil {
+	delete(s.EventAliases, ev.ServerID)
+	var changes calendarMutations
+	changes.recordUpsert(ev)
+	changes.recordAliasDelete(ev.ServerID)
+	if err := s.appendEventLogLocked(changes); err != nil {
 		return err
 	}
 	return s.saveMainLocked()
@@ -731,7 +881,15 @@ func (s *diskState) deleteEvent(serverID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.Events, serverID)
-	if err := s.appendEventLogLocked(nil, []string{serverID}); err != nil {
+	var changes calendarMutations
+	changes.recordDelete(serverID)
+	for aliasID, alias := range s.EventAliases {
+		if aliasID == serverID || alias.CanonicalID == serverID {
+			delete(s.EventAliases, aliasID)
+			changes.recordAliasDelete(aliasID)
+		}
+	}
+	if err := s.appendEventLogLocked(changes); err != nil {
 		return err
 	}
 	return s.saveMainLocked()

@@ -37,6 +37,7 @@ Coremail 不认可旧 synckey 时回 `Status 5 (ServerError)`，而 fork 只对 
 - **纯文本邮件** FetchEmail `BodyTypeMIME` 返回空 BodyMIME → 降级用 EAS 元数据构造 RFC822（`constructRFC822`）。
 - **HTML 邮件原始 MIME 常不可用** → 降级请求 HTML+纯文本组装 multipart/alternative（PR #1）。
 - **EAS Sync Change 是稀疏增量**：常见只有 Read/Flag 变更，merge 时必须保留未携带字段（`ReadPresent`/`FlagStatusPresent`）。
+- **Coremail 日历异常分页会轮换 ServerID 和 UID 重放同一批事件**：不能按“内容相同”全局删除，否则会误吞真实的独立会议，也会丢掉后续 Change/Delete 的远端锚点。当前只在同一非空 UID，或整页 `MoreAvailable` Add 都能匹配缓存时折叠；被折叠 ID 持久化为 `EventAliases`，删除别名不删主事件，主 ID 删除时提升剩余别名，别名内容发生变化时拆回独立事件。
 - **ItemOperations Fetch 可能不回原始 MIME**。
 - 轮询偶发 EOF（长连接被掐）：记日志继续，不崩。
 - 16.x 协议版本不可用：fork 的 wbxml codepage 缺 16.x 的 AirSyncBase 标签，Sync 响应都解不了。
@@ -79,7 +80,7 @@ Coremail 对失效 synckey 回 Status 5；但**服务器整体故障时全文件
 
 1. **IMAP UID 1-based 单调递增、持久化**（serverID↔UID 双向映射 + folderMeta.NextUID/UIDValidity）；UIDVALIDITY 恒定，state 重置才 bump（客户端会全量重下）。
 2. **state 分片落盘**（2026-07-25 重构，原单文件 11.5MB 全量重写债）：`state.json` 主文件只存 DeviceID/PolicyKey/SyncKeys/Folders/FolderMeta（KB 级）；`folders/<fid>.json` 存 Items/UIDs/Deleted；`events.json` 存日历。落盘定向化：单封操作只写本文件夹分片，synckey 类只写主文件，syncMailOnce 用 `mutateFolder` 写两者。旧单文件格式首次加载自动迁移（迁移任一分片写失败必须中止，否则主文件瘦身后丢数据）。**synckey 前进必须落盘**（saveNow→主文件），失效 key 重启恢复会被 Coremail 判失效回 Status 5。
-3. **日历事件 = 快照+增量日志**（2026-07-25，原 10.5MB 全量重写债）：写路径只追加 `events.jsonl`（每行 upsert/delete，fsync），读走内存 map，重启快照+幂等重放；坏尾行（崩溃截断）跳过；压实=超 16MB 写快照+截断（启动时+每日）。不变量：事件批次与 synckey 落盘同节奏（崩溃丢的变更 key 也未推进，重拉补回）；"先快照后截断"窗口靠重放幂等安全；所有 jsonl 写者都在 st.mu 下（无 O_APPEND 并发截断竞争）。
+3. **日历事件 = 快照+增量日志**（2026-07-25，原 10.5MB 全量重写债）：写路径只追加 `events.jsonl`（事件 upsert/delete + ServerID alias 变更，fsync），读走内存 map，重启快照+幂等重放；坏尾行（崩溃截断）跳过；压实=超 16MB 写快照+截断（启动时+每日）。不变量：事件与别名批次和 synckey 落盘同节奏（崩溃丢的变更 key 也未推进，重拉补回）；别名只能指向可见事件且不能与可见 ServerID 重名；"先快照后截断"窗口靠重放幂等安全；所有 jsonl 写者都在 st.mu 下（无 O_APPEND 并发截断竞争）。
 3. **assignUIDs 按传入列表全量重建 UID 映射**——调用方必须传文件夹**全量** items（`addMovedItems` 曾只传增量，清空了目标文件夹原有 UID 映射；ZCode MEDIUM-3 实锤）。
 4. **缓存只存完整结果**：`complete=false` 不写缓存（服务器抖动不固化残缺邮件）。raw.eml 始终缓存。
 5. **只监听 localhost**；InsecureAuth 仅限此场景。config 被改成 0.0.0.0 要拒绝启动。

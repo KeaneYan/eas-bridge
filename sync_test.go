@@ -219,6 +219,27 @@ func TestSyncCalendarSkipsDuringBackoff(t *testing.T) {
 	}
 }
 
+func TestSyncCalendarRequestsSixMonthWindow(t *testing.T) {
+	st := mustLoadTestState(t)
+	st.Folders = []eas.Folder{{ServerID: "calendar", Type: eas.FolderTypeCalendar}}
+	engine := &syncEngine{
+		st: st,
+		c: &easmock.Client{
+			CalendarClient: easmock.CalendarClient{
+				SyncCalendarFunc: func(_ context.Context, _ string, opts eas.CalendarSyncOptions) (*eas.CalendarSyncResult, error) {
+					if opts.DateFilter != eas.FilterSixMonth {
+						t.Fatalf("calendar DateFilter = %d, want FilterSixMonth", opts.DateFilter)
+					}
+					return &eas.CalendarSyncResult{}, nil
+				},
+			},
+		},
+	}
+	if err := engine.syncCalendarOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDedupeEquivalentCalendarEventsKeepsVariants(t *testing.T) {
 	start := time.Date(2026, time.July, 27, 9, 0, 0, 0, time.UTC)
 	base := eas.EventItem{
@@ -253,12 +274,16 @@ func TestDedupeEquivalentCalendarEventsKeepsVariants(t *testing.T) {
 		differentUIDDuplicate.ServerID: differentUIDDuplicate,
 		organizerVariant.ServerID:      organizerVariant,
 	}
-	deleted := dedupeEquivalentCalendarEventsLocked(events)
-	if fmt.Sprint(deleted) != "[Event:2 Event:5]" {
-		t.Fatalf("deleted = %v, want [Event:2 Event:5]", deleted)
+	aliases := map[string]calendarEventAlias{}
+	deleted := dedupeEquivalentCalendarEventsLocked(events, aliases)
+	if fmt.Sprint(deleted) != "[Event:2]" {
+		t.Fatalf("deleted = %v, want [Event:2]", deleted)
 	}
-	if len(events) != 4 {
-		t.Fatalf("events = %d, want 4", len(events))
+	if len(events) != 5 {
+		t.Fatalf("events = %d, want 5", len(events))
+	}
+	if got := aliases["Event:2"].CanonicalID; got != "Event:1" {
+		t.Fatalf("Event:2 alias = %q, want Event:1", got)
 	}
 	if _, ok := events["Event:1"]; !ok {
 		t.Fatal("deterministic first ServerID should survive")
@@ -268,6 +293,9 @@ func TestDedupeEquivalentCalendarEventsKeepsVariants(t *testing.T) {
 	}
 	if _, ok := events["Event:4"]; !ok {
 		t.Fatal("different event without UID must survive")
+	}
+	if _, ok := events["Event:5"]; !ok {
+		t.Fatal("identical events with different UIDs must survive startup repair")
 	}
 	if _, ok := events["Event:6"]; !ok {
 		t.Fatal("same-time event from another organizer must survive")
@@ -281,7 +309,6 @@ func TestRepairDuplicateCalendarEventsOnStartupPropagatesWriteErrors(t *testing.
 		event := eas.EventItem{ServerID: "Event:1", UID: "uid-1", Subject: "duplicate"}
 		duplicate := event
 		duplicate.ServerID = "Event:2"
-		duplicate.UID = "uid-2"
 		st.Events[event.ServerID] = event
 		st.Events[duplicate.ServerID] = duplicate
 		return st
@@ -333,8 +360,10 @@ func TestChangedCalendarEventIsNotDroppedWhenItMatchesAnotherEvent(t *testing.T)
 		oldA.ServerID:   oldA,
 		eventB.ServerID: eventB,
 	}
+	aliases := map[string]calendarEventAlias{}
+	var changes calendarMutations
 	index := newCalendarEventDuplicateIndex(events)
-	if !changeCalendarEventLocked(events, index, changedA) {
+	if !changeCalendarEventLocked(events, aliases, index, changedA, &changes) {
 		t.Fatal("Changed 事件的新内容与另一事件相同，也必须覆盖自己的 ServerID")
 	}
 	if got := events[oldA.ServerID].Subject; got != "new subject" {
@@ -344,9 +373,88 @@ func TestChangedCalendarEventIsNotDroppedWhenItMatchesAnotherEvent(t *testing.T)
 	duplicateAdd := changedA
 	duplicateAdd.ServerID = "Event:C"
 	duplicateAdd.UID = "uid-c"
-	if addCalendarEventLocked(events, index, duplicateAdd) {
-		t.Fatal("Add 路径仍应抑制跨 ServerID 的等价重复事件")
+	if !addCalendarEventLocked(events, aliases, index, duplicateAdd, false, &changes) {
+		t.Fatal("普通 Add 的内容相同但 UID 不同时必须保留为独立事件")
 	}
+	single := &eas.CalendarSyncResult{MoreAvailable: true, Added: []eas.EventItem{duplicateAdd}}
+	if calendarPageIsDuplicateReplay(single, events, aliases, index) {
+		t.Fatal("单个相同内容 Add 不足以证明服务器发生了整页重复回放")
+	}
+}
+
+func TestCalendarAliasLifecycle(t *testing.T) {
+	start := time.Date(2026, time.July, 27, 14, 0, 0, 0, time.UTC)
+	canonical := eas.EventItem{
+		ServerID:  "Event:A",
+		UID:       "uid-a",
+		Subject:   "Standup",
+		StartTime: start,
+		EndTime:   start.Add(time.Hour),
+	}
+	duplicate := canonical
+	duplicate.ServerID = "Event:B"
+	duplicate.UID = "rotated-uid"
+
+	t.Run("delete alias keeps canonical", func(t *testing.T) {
+		events := map[string]eas.EventItem{canonical.ServerID: canonical}
+		aliases := map[string]calendarEventAlias{}
+		index := newCalendarEventDuplicateIndex(events)
+		var changes calendarMutations
+		if addCalendarEventLocked(events, aliases, index, duplicate, true, &changes) {
+			t.Fatal("duplicate replay should be folded into an alias")
+		}
+		if got := aliases[duplicate.ServerID].CanonicalID; got != canonical.ServerID {
+			t.Fatalf("alias target = %q, want %q", got, canonical.ServerID)
+		}
+		if deleteCalendarEventLocked(events, aliases, index, duplicate.ServerID, &changes) {
+			t.Fatal("deleting one alias must not remove the visible event")
+		}
+		if _, ok := events[canonical.ServerID]; !ok {
+			t.Fatal("canonical event was removed with its alias")
+		}
+		if _, ok := aliases[duplicate.ServerID]; ok {
+			t.Fatal("deleted alias is still present")
+		}
+	})
+
+	t.Run("delete canonical promotes alias", func(t *testing.T) {
+		events := map[string]eas.EventItem{canonical.ServerID: canonical}
+		aliases := map[string]calendarEventAlias{
+			duplicate.ServerID: {CanonicalID: canonical.ServerID, UID: duplicate.UID},
+		}
+		index := newCalendarEventDuplicateIndex(events)
+		var changes calendarMutations
+		if !deleteCalendarEventLocked(events, aliases, index, canonical.ServerID, &changes) {
+			t.Fatal("canonical deletion should change the visible resource path")
+		}
+		if _, ok := events[canonical.ServerID]; ok {
+			t.Fatal("deleted canonical ID is still visible")
+		}
+		promoted, ok := events[duplicate.ServerID]
+		if !ok || promoted.UID != duplicate.UID {
+			t.Fatalf("alias was not promoted with its remote identity: %+v", promoted)
+		}
+	})
+
+	t.Run("changed alias splits when contents diverge", func(t *testing.T) {
+		events := map[string]eas.EventItem{canonical.ServerID: canonical}
+		aliases := map[string]calendarEventAlias{
+			duplicate.ServerID: {CanonicalID: canonical.ServerID, UID: duplicate.UID},
+		}
+		index := newCalendarEventDuplicateIndex(events)
+		changed := duplicate
+		changed.Subject = "Independent meeting"
+		var changes calendarMutations
+		if !changeCalendarEventLocked(events, aliases, index, changed, &changes) {
+			t.Fatal("diverging alias Change must create an independent visible event")
+		}
+		if _, ok := aliases[duplicate.ServerID]; ok {
+			t.Fatal("diverging event is still aliased")
+		}
+		if got := events[duplicate.ServerID].Subject; got != changed.Subject {
+			t.Fatalf("changed alias subject = %q, want %q", got, changed.Subject)
+		}
+	})
 }
 
 func TestSyncCalendarStopsAfterDuplicateOnlyPages(t *testing.T) {
@@ -360,7 +468,19 @@ func TestSyncCalendarStopsAfterDuplicateOnlyPages(t *testing.T) {
 		StartTime: start,
 		EndTime:   start.Add(30 * time.Minute),
 	}
-	st.Events[existing.ServerID] = existing
+	existing2 := eas.EventItem{
+		ServerID:  "Event:original:2",
+		UID:       "stable-uid-2",
+		Subject:   "Planning",
+		StartTime: start.Add(time.Hour),
+		EndTime:   start.Add(2 * time.Hour),
+	}
+	if err := st.upsertEvent(existing); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.upsertEvent(existing2); err != nil {
+		t.Fatal(err)
+	}
 
 	calls := 0
 	engine := &syncEngine{
@@ -372,9 +492,12 @@ func TestSyncCalendarStopsAfterDuplicateOnlyPages(t *testing.T) {
 					duplicate := existing
 					duplicate.ServerID = fmt.Sprintf("Event:duplicate:%d", calls)
 					duplicate.UID = fmt.Sprintf("server-rotated-uid:%d", calls)
+					duplicate2 := existing2
+					duplicate2.ServerID = fmt.Sprintf("Event:duplicate:2:%d", calls)
+					duplicate2.UID = fmt.Sprintf("server-rotated-uid:2:%d", calls)
 					return &eas.CalendarSyncResult{
 						MoreAvailable: true,
-						Added:         []eas.EventItem{duplicate},
+						Added:         []eas.EventItem{duplicate, duplicate2},
 					}, nil
 				},
 			},
@@ -386,17 +509,27 @@ func TestSyncCalendarStopsAfterDuplicateOnlyPages(t *testing.T) {
 	if calls != maxCalendarNoProgressPages {
 		t.Fatalf("SyncCalendar calls = %d, want %d", calls, maxCalendarNoProgressPages)
 	}
-	if len(st.Events) != 1 {
-		t.Fatalf("cached events = %d, want 1", len(st.Events))
+	if len(st.Events) != 2 {
+		t.Fatalf("cached events = %d, want 2", len(st.Events))
 	}
 	if _, ok := st.Events[existing.ServerID]; !ok {
 		t.Fatal("stable original event was replaced by a duplicate ServerID")
+	}
+	wantAliases := 2 * maxCalendarNoProgressPages
+	if len(st.EventAliases) != wantAliases {
+		t.Fatalf("aliases = %d, want %d", len(st.EventAliases), wantAliases)
+	}
+	reloaded, err := loadState(st.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.EventAliases) != wantAliases {
+		t.Fatalf("persisted aliases = %d, want %d", len(reloaded.EventAliases), wantAliases)
 	}
 }
 
 func TestSyncCalendarResumesAfterDuplicateOnlyPages(t *testing.T) {
 	st := mustLoadTestState(t)
-	st.Folders = []eas.Folder{{ServerID: "calendar", Type: eas.FolderTypeCalendar}}
 	start := time.Date(2026, time.July, 27, 9, 0, 0, 0, time.UTC)
 	existing := eas.EventItem{
 		ServerID:  "Event:original",
@@ -405,6 +538,13 @@ func TestSyncCalendarResumesAfterDuplicateOnlyPages(t *testing.T) {
 		StartTime: start,
 		EndTime:   start.Add(30 * time.Minute),
 	}
+	existing2 := eas.EventItem{
+		ServerID:  "Event:original:2",
+		UID:       "stable-uid-2",
+		Subject:   "Retrospective",
+		StartTime: start.Add(time.Hour),
+		EndTime:   start.Add(90 * time.Minute),
+	}
 	realEvent := eas.EventItem{
 		ServerID:  "Event:real",
 		UID:       "real-uid",
@@ -412,40 +552,84 @@ func TestSyncCalendarResumesAfterDuplicateOnlyPages(t *testing.T) {
 		StartTime: start.Add(2 * time.Hour),
 		EndTime:   start.Add(3 * time.Hour),
 	}
-	st.Events[existing.ServerID] = existing
-
-	calls := 0
-	engine := &syncEngine{
-		st: st,
-		c: &easmock.Client{
-			CalendarClient: easmock.CalendarClient{
-				SyncCalendarFunc: func(context.Context, string, eas.CalendarSyncOptions) (*eas.CalendarSyncResult, error) {
-					calls++
-					if calls <= maxCalendarNoProgressPages {
-						duplicate := existing
-						duplicate.ServerID = fmt.Sprintf("Event:duplicate:%d", calls)
-						duplicate.UID = fmt.Sprintf("server-rotated-uid:%d", calls)
-						return &eas.CalendarSyncResult{
-							MoreAvailable: true,
-							Added:         []eas.EventItem{duplicate},
-						}, nil
-					}
-					return &eas.CalendarSyncResult{Added: []eas.EventItem{realEvent}}, nil
-				},
-			},
-		},
+	if err := st.mutate(func() {
+		st.Folders = []eas.Folder{{ServerID: "calendar", Type: eas.FolderTypeCalendar}}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.upsertEvent(existing); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.upsertEvent(existing2); err != nil {
+		t.Fatal(err)
 	}
 
+	calls := 0
+	newEngine := func(store *diskState) *syncEngine {
+		return &syncEngine{
+			st: store,
+			c: &easmock.Client{
+				CalendarClient: easmock.CalendarClient{
+					SyncCalendarFunc: func(ctx context.Context, folderID string, _ eas.CalendarSyncOptions) (*eas.CalendarSyncResult, error) {
+						calls++
+						key, err := store.SyncKey(ctx, folderID)
+						if err != nil {
+							return nil, err
+						}
+						var res *eas.CalendarSyncResult
+						switch key {
+						case "", "k1", "k2":
+							page := map[string]int{"": 1, "k1": 2, "k2": 3}[key]
+							duplicate := existing
+							duplicate.ServerID = fmt.Sprintf("Event:duplicate:%d", page)
+							duplicate.UID = fmt.Sprintf("server-rotated-uid:%d", page)
+							duplicate2 := existing2
+							duplicate2.ServerID = fmt.Sprintf("Event:duplicate:2:%d", page)
+							duplicate2.UID = fmt.Sprintf("server-rotated-uid:2:%d", page)
+							nextKey := fmt.Sprintf("k%d", page)
+							res = &eas.CalendarSyncResult{
+								SyncKey:       nextKey,
+								MoreAvailable: true,
+								Added:         []eas.EventItem{duplicate, duplicate2},
+							}
+						case "k3":
+							res = &eas.CalendarSyncResult{SyncKey: "k4", Added: []eas.EventItem{realEvent}}
+						default:
+							return nil, fmt.Errorf("unexpected persisted SyncKey %q", key)
+						}
+						if err := store.SetSyncKey(ctx, folderID, res.SyncKey); err != nil {
+							return nil, err
+						}
+						return res, nil
+					},
+				},
+			},
+		}
+	}
+
+	engine := newEngine(st)
 	if err := engine.syncCalendarOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := st.Events[realEvent.ServerID]; ok {
 		t.Fatal("第一轮应在重复页阈值处结束，尚未读取后续真实事件")
 	}
-	if err := engine.syncCalendarOnce(context.Background()); err != nil {
+	reloaded, err := loadState(st.path)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := st.Events[realEvent.ServerID]; !ok {
+	if got := reloaded.SyncKeys["calendar"]; got != "k3" {
+		t.Fatalf("stalled batch persisted SyncKey = %q, want k3", got)
+	}
+	wantAliases := 2 * maxCalendarNoProgressPages
+	if len(reloaded.EventAliases) != wantAliases {
+		t.Fatalf("persisted aliases = %d, want %d", len(reloaded.EventAliases), wantAliases)
+	}
+
+	if err := newEngine(reloaded).syncCalendarOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := reloaded.Events[realEvent.ServerID]; !ok {
 		t.Fatal("下一轮未从重复页之后恢复并读取真实事件")
 	}
 	if calls != maxCalendarNoProgressPages+1 {
