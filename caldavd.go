@@ -400,16 +400,18 @@ func easRecurrenceToRRULE(r *eas.Recurrence) string {
 
 // ---------- HTTP 服务 ----------
 
-// newCalDAVServer 构建 CalDAV HTTP 服务（Basic Auth），由 main 启动/优雅关闭。
+// newCalDAVServer 构建 CalDAV HTTP 服务（Basic + Digest 认证），由 main 启动/优雅关闭。
+// Digest 必须存在：macOS CoreDAV 拒绝明文 HTTP 上的 Basic（见 digest.go 头部注释）。
 func newCalDAVServer(engine *syncEngine, addr string) *http.Server {
 	backend := &caldavBackend{engine: engine}
 	handler := &caldav.Handler{Backend: backend}
 
 	cfg := engine.cfg
+	dk := newDigestKeys()
 	authed := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		user, pass, ok := r.BasicAuth()
-		if !ok || user != cfg.User || pass != cfg.Password {
-			w.Header().Set("WWW-Authenticate", `Basic realm="eas-bridge"`)
+		if !caldavAuthorized(r, cfg.User, cfg.Password, dk) {
+			w.Header().Add("WWW-Authenticate", `Basic realm="eas-bridge"`)
+			w.Header().Add("WWW-Authenticate", dk.challenge())
 			http.Error(w, "未授权", http.StatusUnauthorized)
 			return
 		}

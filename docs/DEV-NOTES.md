@@ -43,6 +43,11 @@ Coremail 不认可旧 synckey 时回 `Status 5 (ServerError)`，而 fork 只对 
 
 ## 二、EAS 协议实战
 
+### macOS CoreDAV 拒绝明文 HTTP 上的 Basic 认证（2026-07-27 日历账户接入）
+Apple 日历添加 CalDAV 账户报"无法验证账户名或密码"的根因：accountsd 日志原文 `Cancelling authentication challenge for insecure connection using basic authentication`——**CoreDAV 层明文规定非 TLS 连接上取消 Basic 认证挑战**（Apple Mail 不受影响，它有"允许不安全连接"开关；日历账户没有）。URLSession 层本身允许 Basic over HTTP（Swift 实测 207），是 CoreDAV 自己的策略。
+修复：CalDAV 端点同时宣告 **Digest（RFC 7616 MD5, qop=auth）+ Basic**（digest.go）。Digest 挑战-应答不明文传密码，CoreDAV 接受。nonce 无状态（base64(ts.HMAC-SHA256(进程随机 secret))，TTL 30min）。
+**已接受的取舍**：nonce 无服务端状态、不校验 nc 单调性 → TTL 内同 URI 理论上可重放；威胁面仅限回环（只监听 127.0.0.1），本地进程能嗅探回环时 Basic 也早已裸奔，不因此加状态存储。
+
 ### ApplicationData 子元素线序：对齐 Z-Push
 `buildEventApp`（fork calendar.go）按 **Z-Push SyncAppointment mapping 数组**的线序输出：
 `TimeZone→DTStamp→StartTime→Subject→UID→Location→EndTime→Recurrence→Sensitivity→BusyStatus→AllDayEvent→Reminder→Attendees→Body→Exceptions`，由 `TestBuildEventApp_wireOrder` 锁定。
