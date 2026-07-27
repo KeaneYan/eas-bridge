@@ -38,6 +38,7 @@ Coremail 不认可旧 synckey 时回 `Status 5 (ServerError)`，而 fork 只对 
 - **HTML 邮件原始 MIME 常不可用** → 降级请求 HTML+纯文本组装 multipart/alternative（PR #1）。
 - **EAS Sync Change 是稀疏增量**：常见只有 Read/Flag 变更，merge 时必须保留未携带字段（`ReadPresent`/`FlagStatusPresent`）。
 - **Coremail 日历异常分页会轮换 ServerID 和 UID 重放同一批事件**：不能按“内容相同”全局删除，否则会误吞真实的独立会议，也会丢掉后续 Change/Delete 的远端锚点。当前只在同一非空 UID，或至少两条 Add 组成、整页 `MoreAvailable` 都能匹配缓存时折叠；被折叠 ID 持久化为 `EventAliases`，删除别名不删主事件，主 ID 删除时提升剩余别名，别名内容发生变化时拆回独立事件。异常分页可能永远产生新 ID，因此 replay 别名按当前页滚动替换，不能无限累计；同 UID 的稳定别名保留，但旧版本无法标记来源的历史别名每事件最多保留 8 条。
+- **异常日历分页必须单独退避**：连续三页只有可证明的重复回放且 `MoreAvailable` 不结束时，本轮先持久化已推进的 SyncKey，再按 1m→5m→15m→30m 暂缓后续轮询；只要一轮出现真实事件变化或正常结束就清零。它与 Status 5 退避相互独立，不能让普通日历更新降频。
 - **ItemOperations Fetch 可能不回原始 MIME**。
 - 轮询偶发 EOF（长连接被掐）：记日志继续，不崩。
 - 16.x 协议版本不可用：fork 的 wbxml codepage 缺 16.x 的 AirSyncBase 标签，Sync 响应都解不了。

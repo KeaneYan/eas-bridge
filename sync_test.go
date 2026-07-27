@@ -609,6 +609,15 @@ func TestSyncCalendarStopsAfterDuplicateOnlyPages(t *testing.T) {
 	if len(reloaded.EventAliases) != wantAliases {
 		t.Fatalf("persisted aliases = %d, want %d", len(reloaded.EventAliases), wantAliases)
 	}
+	if d := engine.calendarReplayBackoffRemaining(); d <= 0 || d > time.Minute {
+		t.Fatalf("duplicate-only round backoff = %v, want (0, 1m]", d)
+	}
+	if err := engine.syncCalendar(context.Background()); !errors.Is(err, ErrCalendarReplayBackoffSkip) {
+		t.Fatalf("duplicate replay backoff error = %v, want ErrCalendarReplayBackoffSkip", err)
+	}
+	if calls != maxCalendarNoProgressPages {
+		t.Fatalf("backoff should suppress another remote page fetch; calls = %d", calls)
+	}
 }
 
 func TestSyncCalendarResumesAfterDuplicateOnlyPages(t *testing.T) {
@@ -717,6 +726,18 @@ func TestSyncCalendarResumesAfterDuplicateOnlyPages(t *testing.T) {
 	}
 	if calls != maxCalendarNoProgressPages+1 {
 		t.Fatalf("SyncCalendar calls = %d, want %d", calls, maxCalendarNoProgressPages+1)
+	}
+}
+
+func TestCalendarReplayBackoffClearsAfterNormalCompletion(t *testing.T) {
+	engine := &syncEngine{}
+	engine.trackCalendarReplayResult(true)
+	if d := engine.calendarReplayBackoffRemaining(); d <= 0 {
+		t.Fatal("stalled round did not start replay backoff")
+	}
+	engine.trackCalendarReplayResult(false)
+	if d := engine.calendarReplayBackoffRemaining(); d != 0 {
+		t.Fatalf("normal completion did not clear replay backoff: %v", d)
 	}
 }
 
