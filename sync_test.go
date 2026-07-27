@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -214,6 +215,106 @@ func TestSyncCalendarSkipsDuringBackoff(t *testing.T) {
 	}
 	if calls != 0 {
 		t.Fatalf("退避期不应发起 SyncCalendar，实际 %d 次", calls)
+	}
+}
+
+func TestDedupeEquivalentCalendarEventsKeepsVariants(t *testing.T) {
+	start := time.Date(2026, time.July, 27, 9, 0, 0, 0, time.UTC)
+	base := eas.EventItem{
+		ServerID:  "Event:1",
+		UID:       "stable-uid",
+		Subject:   "Standup",
+		StartTime: start,
+		EndTime:   start.Add(30 * time.Minute),
+	}
+	duplicate := base
+	duplicate.ServerID = "Event:2"
+	variant := base
+	variant.ServerID = "Event:3"
+	variant.Subject = "Standup (updated)"
+	noUID := base
+	noUID.ServerID = "Event:4"
+	noUID.UID = ""
+	noUID.Subject = "Independent event"
+	differentUIDDuplicate := base
+	differentUIDDuplicate.ServerID = "Event:5"
+	differentUIDDuplicate.UID = "server-rotated-uid"
+	organizerVariant := base
+	organizerVariant.ServerID = "Event:6"
+	organizerVariant.UID = "independent-uid"
+	organizerVariant.OrganizerEmail = "other@example.com"
+
+	events := map[string]eas.EventItem{
+		base.ServerID:                  base,
+		duplicate.ServerID:             duplicate,
+		variant.ServerID:               variant,
+		noUID.ServerID:                 noUID,
+		differentUIDDuplicate.ServerID: differentUIDDuplicate,
+		organizerVariant.ServerID:      organizerVariant,
+	}
+	deleted := dedupeEquivalentCalendarEventsLocked(events)
+	if fmt.Sprint(deleted) != "[Event:2 Event:5]" {
+		t.Fatalf("deleted = %v, want [Event:2 Event:5]", deleted)
+	}
+	if len(events) != 4 {
+		t.Fatalf("events = %d, want 4", len(events))
+	}
+	if _, ok := events["Event:1"]; !ok {
+		t.Fatal("deterministic first ServerID should survive")
+	}
+	if _, ok := events["Event:3"]; !ok {
+		t.Fatal("same-UID variant must survive")
+	}
+	if _, ok := events["Event:4"]; !ok {
+		t.Fatal("different event without UID must survive")
+	}
+	if _, ok := events["Event:6"]; !ok {
+		t.Fatal("same-time event from another organizer must survive")
+	}
+}
+
+func TestSyncCalendarStopsAfterDuplicateOnlyPages(t *testing.T) {
+	st := mustLoadTestState(t)
+	st.Folders = []eas.Folder{{ServerID: "calendar", Type: eas.FolderTypeCalendar}}
+	start := time.Date(2026, time.July, 27, 9, 0, 0, 0, time.UTC)
+	existing := eas.EventItem{
+		ServerID:  "Event:original",
+		UID:       "stable-uid",
+		Subject:   "Standup",
+		StartTime: start,
+		EndTime:   start.Add(30 * time.Minute),
+	}
+	st.Events[existing.ServerID] = existing
+
+	calls := 0
+	engine := &syncEngine{
+		st: st,
+		c: &easmock.Client{
+			CalendarClient: easmock.CalendarClient{
+				SyncCalendarFunc: func(context.Context, string, eas.CalendarSyncOptions) (*eas.CalendarSyncResult, error) {
+					calls++
+					duplicate := existing
+					duplicate.ServerID = fmt.Sprintf("Event:duplicate:%d", calls)
+					duplicate.UID = fmt.Sprintf("server-rotated-uid:%d", calls)
+					return &eas.CalendarSyncResult{
+						MoreAvailable: true,
+						Added:         []eas.EventItem{duplicate},
+					}, nil
+				},
+			},
+		},
+	}
+	if err := engine.syncCalendarOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls != maxCalendarNoProgressPages {
+		t.Fatalf("SyncCalendar calls = %d, want %d", calls, maxCalendarNoProgressPages)
+	}
+	if len(st.Events) != 1 {
+		t.Fatalf("cached events = %d, want 1", len(st.Events))
+	}
+	if _, ok := st.Events[existing.ServerID]; !ok {
+		t.Fatal("stable original event was replaced by a duplicate ServerID")
 	}
 }
 

@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -405,6 +408,7 @@ func easRecurrenceToRRULE(r *eas.Recurrence) string {
 func newCalDAVServer(engine *syncEngine, addr string) *http.Server {
 	backend := &caldavBackend{engine: engine}
 	handler := &caldav.Handler{Backend: backend}
+	compatibleHandler := logCalDAVFailures(handleAppleCalendarProperties(handler))
 
 	cfg := engine.cfg
 	dk := newDigestKeys()
@@ -415,11 +419,127 @@ func newCalDAVServer(engine *syncEngine, addr string) *http.Server {
 			http.Error(w, "未授权", http.StatusUnauthorized)
 			return
 		}
-		handler.ServeHTTP(w, r)
+		compatibleHandler.ServeHTTP(w, r)
 	})
 
 	log.Printf("[caldav] 监听 %s", addr)
 	return &http.Server{Addr: addr, Handler: authed}
+}
+
+type calDAVStatusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *calDAVStatusWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *calDAVStatusWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+// logCalDAVFailures records enough protocol context to diagnose client
+// compatibility issues without logging request bodies or credentials.
+func logCalDAVFailures(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var propertyNames []string
+		if r.Method == "PROPPATCH" && r.Body != nil {
+			body, err := io.ReadAll(r.Body)
+			if err == nil {
+				r.Body = io.NopCloser(bytes.NewReader(body))
+				propertyNames = calDAVPropertyNames(body)
+			}
+		}
+		sw := &calDAVStatusWriter{ResponseWriter: w}
+		next.ServeHTTP(sw, r)
+		if sw.status >= http.StatusBadRequest {
+			if len(propertyNames) > 0 {
+				log.Printf("[caldav] %s %s properties=%s -> %d", r.Method, r.URL.EscapedPath(), strings.Join(propertyNames, ","), sw.status)
+			} else {
+				log.Printf("[caldav] %s %s -> %d", r.Method, r.URL.EscapedPath(), sw.status)
+			}
+		}
+	})
+}
+
+func calDAVPropertyNames(body []byte) []string {
+	dec := xml.NewDecoder(bytes.NewReader(body))
+	var names []string
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			break
+		}
+		start, ok := tok.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		switch start.Name.Local {
+		case "propertyupdate", "set", "remove", "prop":
+			continue
+		}
+		names = append(names, "{"+start.Name.Space+"}"+start.Name.Local)
+	}
+	return names
+}
+
+var supportedAppleCalendarProperties = map[string]string{
+	"{http://apple.com/ns/ical/}calendar-color": "calendar-color",
+	"{http://apple.com/ns/ical/}calendar-order": "calendar-order",
+}
+
+// handleAppleCalendarProperties accepts macOS Calendar's client-side display
+// metadata. go-webdav 0.7 returns 501 for every PROPPATCH, which makes Calendar
+// show a permanent sync warning even though event synchronization succeeded.
+// Color and order do not affect EAS data, so acknowledging them as dead
+// properties is safe; all other property updates still reach the normal handler.
+func handleAppleCalendarProperties(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "PROPPATCH" || r.URL.Path != caldavCalendarPath || r.Body == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		if err != nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		names := calDAVPropertyNames(body)
+		if len(names) == 0 {
+			next.ServeHTTP(w, r)
+			return
+		}
+		locals := make([]string, 0, len(names))
+		for _, name := range names {
+			local, ok := supportedAppleCalendarProperties[name]
+			if !ok {
+				next.ServeHTTP(w, r)
+				return
+			}
+			locals = append(locals, local)
+		}
+
+		var response strings.Builder
+		response.WriteString(`<?xml version="1.0" encoding="utf-8"?>`)
+		response.WriteString(`<d:multistatus xmlns:d="DAV:" xmlns:a="http://apple.com/ns/ical/"><d:response>`)
+		response.WriteString(`<d:href>` + caldavCalendarPath + `</d:href><d:propstat><d:prop>`)
+		for _, local := range locals {
+			response.WriteString(`<a:` + local + `/>`)
+		}
+		response.WriteString(`</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`)
+
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.WriteHeader(http.StatusMultiStatus)
+		_, _ = io.WriteString(w, response.String())
+	})
 }
 
 func errCalDAVReadOnly(op string) error {
