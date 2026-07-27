@@ -31,6 +31,9 @@ type syncEngine struct {
 
 	backoffMu sync.Mutex
 	backoff   map[string]folderBackoff
+
+	attachmentBackoffMu sync.Mutex
+	attachmentBackoff   map[string]attachmentBackoff
 }
 
 // folderBackoff 记录单个同步通道（邮件文件夹/日历）的连续 Status 5 退避状态。
@@ -163,8 +166,13 @@ func newSyncEngine(cfg *config) (*syncEngine, error) {
 	if err := c.Provision(context.Background()); err != nil {
 		return nil, fmt.Errorf("Provision: %w", err)
 	}
-	engine := &syncEngine{cfg: cfg, st: st, c: c, backoff: map[string]folderBackoff{}}
-	engine.scheduleCachePrune()
+	engine := &syncEngine{
+		cfg:               cfg,
+		st:                st,
+		c:                 c,
+		backoff:           map[string]folderBackoff{},
+		attachmentBackoff: map[string]attachmentBackoff{},
+	}
 	return engine, nil
 }
 

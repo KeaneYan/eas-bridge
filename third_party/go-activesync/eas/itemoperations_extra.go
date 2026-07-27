@@ -10,6 +10,11 @@ import (
 	"github.com/hstern/go-activesync/wbxml"
 )
 
+// ErrAttachmentDataMissing reports a successful FetchAttachment response that
+// does not contain attachment bytes. Callers may retry this condition with
+// backoff without treating unrelated transport or protocol failures the same.
+var ErrAttachmentDataMissing = errors.New("eas: FetchAttachment: no data in response")
+
 // EmptyFolderContents removes every item in folderID. If
 // deleteSubfolders is true, sub-folders are removed too. The folder
 // itself is preserved.
@@ -194,7 +199,7 @@ func (c *httpClient) FetchAttachment(ctx context.Context, fileReference string, 
 		}
 	}
 	if len(out.Data) == 0 {
-		return nil, errors.New("eas: FetchAttachment: no data in response")
+		return nil, ErrAttachmentDataMissing
 	}
 	return out, nil
 }

@@ -13,6 +13,19 @@ import (
 	"time"
 )
 
+func TestCachePrunerStopsWithLifecycle(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx, cancel := context.WithCancel(context.Background())
+	engine := &syncEngine{st: mustLoadTestState(t)}
+	done := engine.scheduleCachePrune(ctx)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cache pruner did not stop after lifecycle cancellation")
+	}
+}
+
 func TestCachePathsAreVersionedAndPathSafe(t *testing.T) {
 	dir := messageCacheDir("../../folder", "../../message")
 	if !strings.Contains(dir, string(filepath.Separator)+mimeCacheVersion+string(filepath.Separator)) {

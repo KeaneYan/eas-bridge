@@ -40,6 +40,7 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	engine.scheduleCachePrune(ctx)
 
 	// 文件夹列表是服务发现所必需的，启动时同步一次。
 	log.Println("[sync] 同步文件夹列表...")
@@ -68,7 +69,7 @@ func main() {
 	}()
 
 	// 启动 CalDAV 服务
-	calBackend := &caldavBackend{engine: engine}
+	calBackend := &caldavBackend{engine: engine, lifecycleCtx: ctx}
 	calSrv := newCalDAVServer(calBackend, cfg.CalDAVAddr)
 	go func() {
 		if err := calSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -81,9 +82,16 @@ func main() {
 	go engine.poller(ctx, time.Duration(cfg.PollSecs)*time.Second, func(folderID string) {
 		imapD.broadcast(folderID)
 	})
-	go calBackend.calendarPoller(ctx, time.Duration(cfg.PollSecs)*time.Second)
+	go calBackend.calendarPoller(ctx, time.Duration(cfg.CalendarPollSecs)*time.Second)
 
-	log.Printf("[eas-bridge] 就绪。IMAP %s  SMTP %s  CalDAV %s（Ctrl+C 退出）", cfg.IMAPAddr, cfg.SMTPAddr, cfg.CalDAVAddr)
+	log.Printf(
+		"[eas-bridge] 就绪。IMAP %s  SMTP %s  CalDAV %s（邮件轮询 %ds，日历轮询 %ds；Ctrl+C 退出）",
+		cfg.IMAPAddr,
+		cfg.SMTPAddr,
+		cfg.CalDAVAddr,
+		cfg.PollSecs,
+		cfg.CalendarPollSecs,
+	)
 
 	// 邮件与日历预热放到后台，避免大邮箱或多年日历阻塞三个本地服务启动。
 	go func() {

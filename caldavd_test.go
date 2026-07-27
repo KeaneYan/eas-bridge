@@ -209,6 +209,44 @@ func TestCalendarReadReturns503WhenInitialSyncFails(t *testing.T) {
 	}
 }
 
+func TestCalendarBackgroundRefreshStopsWithLifecycle(t *testing.T) {
+	st := mustLoadTestState(t)
+	st.Folders = []eas.Folder{{ServerID: "calendar", Type: eas.FolderTypeCalendar}}
+	st.Events["cached"] = eas.EventItem{ServerID: "cached", Subject: "cached"}
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	engine := &syncEngine{
+		st: st,
+		c: &easmock.Client{
+			CalendarClient: easmock.CalendarClient{
+				SyncCalendarFunc: func(ctx context.Context, _ string, _ eas.CalendarSyncOptions) (*eas.CalendarSyncResult, error) {
+					close(started)
+					<-ctx.Done()
+					close(stopped)
+					return nil, ctx.Err()
+				},
+			},
+		},
+	}
+	lifecycleCtx, cancel := context.WithCancel(context.Background())
+	backend := &caldavBackend{engine: engine, lifecycleCtx: lifecycleCtx}
+
+	if err := backend.maybeSyncCalendar(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background refresh did not start")
+	}
+	cancel()
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background refresh did not stop after lifecycle cancellation")
+	}
+}
+
 func TestEmptyCalendarWithPersistedSyncKeyIsUsableCache(t *testing.T) {
 	st := mustLoadTestState(t)
 	st.Folders = []eas.Folder{{ServerID: "calendar", Type: eas.FolderTypeCalendar}}

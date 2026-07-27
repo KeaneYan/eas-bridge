@@ -33,7 +33,8 @@ const (
 
 // caldavBackend 实现 caldav.Backend：EAS 日历事件 → iCalendar 只读桥。
 type caldavBackend struct {
-	engine *syncEngine
+	engine       *syncEngine
+	lifecycleCtx context.Context
 
 	calMu       sync.Mutex
 	lastCalSync time.Time
@@ -172,10 +173,16 @@ func (b *caldavBackend) maybeSyncCalendar(ctx context.Context) error {
 
 	if b.hasUsableCalendarCache() {
 		go func() {
-			syncCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			parent := b.lifecycleCtx
+			if parent == nil {
+				parent = context.Background()
+			}
+			syncCtx, cancel := context.WithTimeout(parent, 10*time.Minute)
 			defer cancel()
 			if err := b.syncCalendar(syncCtx); err != nil {
-				log.Printf("[caldav] 后台同步失败（继续使用缓存）: %v", err)
+				if !errors.Is(err, context.Canceled) {
+					log.Printf("[caldav] 后台同步失败（继续使用缓存）: %v", err)
+				}
 			}
 		}()
 		return nil

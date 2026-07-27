@@ -76,6 +76,20 @@ Coremail 对失效 synckey 回 Status 5；但**服务器整体故障时全文件
 **两条并发纪律**：`trackSyncResult` 必须放 singleflight fn **内**（flight 合并后每个调用者都会拿到同一 err，放外面会重复升档，ZCode H-1）；poller 退避期**不得 onChange 广播**（无新数据却刷醒客户端）。
 **后续（2026-07-25 P3）**：日历退避跳过改返回 `ErrSyncBackoffSkip` sentinel（maybeSyncCalendar 内部消化，lastCalSync 只在真成功推进）；syncMail 仍返回 nil（IMAP 会把错误透传客户端）。优雅退出：main 信号后 cancel→CalDAV/SMTP 渐进 Shutdown(10s)→IMAP Close；`imapd.shuttingDown` 标志区分"信号抢先于监听"时 go-imap 未导出 errClosed 与真故障，防 log.Fatal 误判。
 
+### 后台任务必须绑定 daemon 生命周期
+CalDAV stale-while-revalidate、邮件/日历 poller 和 MIME 缓存修剪都必须派生自 main
+的根 `ctx`。请求级 context 只控制当前客户端请求；`context.Background()` 会让后台刷新在
+SIGTERM 后继续访问 EAS/state。缓存修剪同样要在 ctx 取消后停止 ticker。
+
+邮件和日历的负载特征不同：`poll_seconds` 只控制邮件，日历由
+`calendar_poll_seconds` 独立控制；旧配置未提供后者时自动沿用前者。
+
+### FetchAttachment 明确无数据时要退避
+Coremail 偶尔会为已声明的 FileReference 返回成功响应但不含 Data。Apple Mail 会重复
+请求同一个 MIME part；如果每次都直打 EAS，会形成每分钟一次的无效下载。只对
+`FetchAttachment: no data in response` 做纯内存 1m→5m→15m→1h 退避；普通网络错误
+仍立即重试，成功后清除退避，且任何失败都不得写入附件缓存。
+
 ## 三、架构不变量
 
 1. **IMAP UID 1-based 单调递增、持久化**（serverID↔UID 双向映射 + folderMeta.NextUID/UIDValidity）；UIDVALIDITY 恒定，state 重置才 bump（客户端会全量重下）。
