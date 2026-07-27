@@ -505,6 +505,41 @@ func TestCalendarReplayAliasesUseRollingPage(t *testing.T) {
 	}
 }
 
+func TestCalendarReplayAliasMigrationIsBounded(t *testing.T) {
+	canonical := eas.EventItem{
+		ServerID: "Event:canonical",
+		UID:      "stable-uid",
+		Subject:  "Standup",
+	}
+	events := map[string]eas.EventItem{canonical.ServerID: canonical}
+	aliases := map[string]calendarEventAlias{}
+	for i := 0; i < maxCalendarStableAliases+5; i++ {
+		id := fmt.Sprintf("Event:legacy:%02d", i)
+		aliases[id] = calendarEventAlias{
+			CanonicalID: canonical.ServerID,
+			UID:         canonical.UID,
+		}
+	}
+	current := canonical
+	current.ServerID = "Event:current-replay"
+	index := newCalendarEventDuplicateIndex(events)
+	var changes calendarMutations
+
+	pruneCalendarReplayAliasesLocked(
+		events,
+		aliases,
+		index,
+		[]eas.EventItem{current},
+		&changes,
+	)
+	if len(aliases) != maxCalendarStableAliases {
+		t.Fatalf("legacy stable aliases = %d, want cap %d", len(aliases), maxCalendarStableAliases)
+	}
+	if len(changes.aliasDeletes) != 5 {
+		t.Fatalf("pruned legacy aliases = %d, want 5", len(changes.aliasDeletes))
+	}
+}
+
 func TestSyncCalendarStopsAfterDuplicateOnlyPages(t *testing.T) {
 	st := mustLoadTestState(t)
 	st.Folders = []eas.Folder{{ServerID: "calendar", Type: eas.FolderTypeCalendar}}

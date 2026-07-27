@@ -19,6 +19,7 @@ import (
 const (
 	asVersion                  = "14.0"
 	maxCalendarNoProgressPages = 3
+	maxCalendarStableAliases   = 8
 )
 
 // syncEngine 封装 EAS 客户端与同步状态。
@@ -722,16 +723,34 @@ func pruneCalendarReplayAliasesLocked(
 		}
 		keep[canonicalID][ev.ServerID] = struct{}{}
 	}
+	staleStable := map[string][]string{}
 	for aliasID, alias := range aliases {
 		currentIDs, touched := keep[alias.CanonicalID]
-		if !alias.Replay || !touched {
+		if !touched {
 			continue
 		}
 		if _, current := currentIDs[aliasID]; current {
 			continue
 		}
+		if !alias.Replay {
+			staleStable[alias.CanonicalID] = append(staleStable[alias.CanonicalID], aliasID)
+			continue
+		}
 		delete(aliases, aliasID)
 		changes.recordAliasDelete(aliasID)
+	}
+	// Aliases from the first PR revision had no replay marker, and Coremail may
+	// reuse the UID while rotating ServerIDs. Retain a small stable-ID reserve
+	// per event, but cap it so legacy state also converges after an upgrade.
+	for _, ids := range staleStable {
+		if len(ids) <= maxCalendarStableAliases {
+			continue
+		}
+		sort.Strings(ids)
+		for _, aliasID := range ids[:len(ids)-maxCalendarStableAliases] {
+			delete(aliases, aliasID)
+			changes.recordAliasDelete(aliasID)
+		}
 	}
 }
 
@@ -761,8 +780,9 @@ func addCalendarEventLocked(
 	}
 	if alias, ok := aliases[ev.ServerID]; ok {
 		if existing, ok := events[alias.CanonicalID]; ok && calendarEventsSameContent(existing, ev) {
-			if alias.UID != ev.UID {
+			if alias.UID != ev.UID || (duplicateReplay && !alias.Replay) {
 				alias.UID = ev.UID
+				alias.Replay = alias.Replay || duplicateReplay
 				aliases[ev.ServerID] = alias
 				changes.recordAlias(ev.ServerID, alias)
 			}
@@ -774,13 +794,12 @@ func addCalendarEventLocked(
 
 	var canonicalID string
 	var equivalent bool
-	replayAlias := false
+	replayAlias := duplicateReplay
 	if ev.UID != "" {
 		canonicalID, equivalent = index.findEquivalent(ev, false)
 	}
 	if !equivalent && duplicateReplay {
 		canonicalID, equivalent = index.findEquivalent(ev, true)
-		replayAlias = equivalent
 	}
 	if equivalent {
 		alias := calendarEventAlias{CanonicalID: canonicalID, UID: ev.UID, Replay: replayAlias}
