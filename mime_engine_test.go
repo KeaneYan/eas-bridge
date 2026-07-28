@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -372,6 +373,150 @@ func TestFetchAttachmentNoDataUsesBackoffAndRecovers(t *testing.T) {
 	}
 	if err := engine.attachmentBackoffError(key); err != nil {
 		t.Fatalf("successful retry did not clear backoff: %v", err)
+	}
+}
+
+func TestUnknownSizeAttachmentBackoffDoesNotBreakMetadataFetch(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	engine := &syncEngine{c: &easmock.Client{
+		FolderClient: easmock.FolderClient{
+			FetchAttachmentFunc: func(context.Context, string, int64, int64) (*eas.FetchAttachmentResult, error) {
+				return nil, eas.ErrAttachmentDataMissing
+			},
+		},
+	}}
+	plan := newMessagePlan("folder", "message", eas.EmailItem{
+		ServerID: "message",
+		BodyType: eas.BodyTypePlain,
+		Body:     "message",
+		Attachments: []eas.Attachment{{
+			FileReference: "unknown-size",
+			DisplayName:   "unknown.bin",
+		}},
+	}, "message")
+
+	structure, err := plan.bodyStructure(context.Background(), engine)
+	if err != nil {
+		t.Fatalf("BODYSTRUCTURE should survive unavailable unknown-size attachment: %v", err)
+	}
+	if structure == nil {
+		t.Fatal("nil BODYSTRUCTURE")
+	}
+	if _, err := plan.estimatedRFC822Size(context.Background(), engine); err != nil {
+		t.Fatalf("RFC822.SIZE should survive unavailable unknown-size attachment: %v", err)
+	}
+}
+
+func TestAttachmentMissingRefreshesFileReferenceAndRetries(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st := mustLoadTestState(t)
+	oldMeta := eas.Attachment{
+		FileReference:     "old-ref",
+		DisplayName:       "report.pdf",
+		ContentType:       "application/pdf",
+		EstimatedDataSize: 7,
+	}
+	newMeta := oldMeta
+	newMeta.FileReference = "new-ref"
+	st.Folders = []eas.Folder{{ServerID: "inbox", Type: eas.FolderTypeInbox}}
+	st.Items["inbox"] = []eas.EmailItem{{
+		ServerID:       "message",
+		BodyType:       eas.BodyTypePlain,
+		Body:           "summary",
+		HasAttachments: true,
+		Attachments:    []eas.Attachment{oldMeta},
+	}}
+	payload := []byte("PDFDATA")
+	var refs []string
+	engine := &syncEngine{
+		st: st,
+		c: &easmock.Client{
+			EmailClient: easmock.EmailClient{
+				FetchEmailFunc: func(_ context.Context, _, serverID string, opts eas.FetchEmailOptions) (*eas.EmailItem, error) {
+					switch opts.BodyType {
+					case eas.BodyTypeMIME:
+						return &eas.EmailItem{ServerID: serverID}, nil
+					case eas.BodyTypeHTML:
+						return &eas.EmailItem{
+							ServerID:       serverID,
+							BodyType:       eas.BodyTypeHTML,
+							Body:           "<p>complete</p>",
+							HasAttachments: true,
+							Attachments:    []eas.Attachment{newMeta},
+						}, nil
+					case eas.BodyTypePlain:
+						return &eas.EmailItem{ServerID: serverID, BodyType: eas.BodyTypePlain, Body: "complete"}, nil
+					default:
+						return nil, nil
+					}
+				},
+			},
+			FolderClient: easmock.FolderClient{
+				FetchAttachmentFunc: func(_ context.Context, ref string, _, _ int64) (*eas.FetchAttachmentResult, error) {
+					refs = append(refs, ref)
+					if ref == oldMeta.FileReference {
+						return nil, eas.ErrAttachmentDataMissing
+					}
+					return &eas.FetchAttachmentResult{
+						Data: []byte(base64.StdEncoding.EncodeToString(payload)),
+					}, nil
+				},
+			},
+		},
+	}
+
+	got, err := engine.fetchAttachmentCached(context.Background(), "inbox", "message", oldMeta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("payload = %q, want %q", got, payload)
+	}
+	if fmt.Sprint(refs) != "[old-ref new-ref]" {
+		t.Fatalf("attachment references = %v, want [old-ref new-ref]", refs)
+	}
+	data, err := os.ReadFile(messageMetadataPath("inbox", "message"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cached cachedMessageMetadata
+	if err := json.Unmarshal(data, &cached); err != nil {
+		t.Fatal(err)
+	}
+	if got := cached.Item.Attachments[0].FileReference; got != "new-ref" {
+		t.Fatalf("cached refreshed FileReference = %q, want new-ref", got)
+	}
+	refreshedData, err := os.ReadFile(attachmentCachePath("inbox", "message", "new-ref"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(refreshedData, payload) {
+		t.Fatalf("refreshed attachment cache = %q, want %q", refreshedData, payload)
+	}
+}
+
+func TestAttachmentBackoffCapsAtOneDay(t *testing.T) {
+	engine := &syncEngine{}
+	for i := 0; i < 20; i++ {
+		engine.trackAttachmentFailure("attachment:key", eas.ErrAttachmentDataMissing)
+		engine.attachmentBackoffMu.Lock()
+		state := engine.attachmentBackoff["attachment:key"]
+		state.nextRetry = time.Now().Add(-time.Second)
+		engine.attachmentBackoff["attachment:key"] = state
+		engine.attachmentBackoffMu.Unlock()
+	}
+	engine.attachmentBackoffMu.Lock()
+	failures := engine.attachmentBackoff["attachment:key"].failures
+	engine.attachmentBackoffMu.Unlock()
+	if failures != 20 {
+		t.Fatalf("failures = %d, want 20", failures)
+	}
+	engine.trackAttachmentFailure("attachment:key", eas.ErrAttachmentDataMissing)
+	engine.attachmentBackoffMu.Lock()
+	remaining := time.Until(engine.attachmentBackoff["attachment:key"].nextRetry)
+	engine.attachmentBackoffMu.Unlock()
+	if remaining <= 23*time.Hour || remaining > 24*time.Hour {
+		t.Fatalf("capped attachment backoff = %v, want (23h, 24h]", remaining)
 	}
 }
 

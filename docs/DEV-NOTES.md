@@ -77,6 +77,20 @@ Coremail 对失效 synckey 回 Status 5；但**服务器整体故障时全文件
 **两条并发纪律**：`trackSyncResult` 必须放 singleflight fn **内**（flight 合并后每个调用者都会拿到同一 err，放外面会重复升档，ZCode H-1）；poller 退避期**不得 onChange 广播**（无新数据却刷醒客户端）。
 **后续（2026-07-25 P3）**：日历退避跳过改返回 `ErrSyncBackoffSkip` sentinel（maybeSyncCalendar 内部消化，lastCalSync 只在真成功推进）；syncMail 仍返回 nil（IMAP 会把错误透传客户端）。优雅退出：main 信号后 cancel→CalDAV/SMTP 渐进 Shutdown(10s)→IMAP Close；`imapd.shuttingDown` 标志区分"信号抢先于监听"时 go-imap 未导出 errClosed 与真故障，防 log.Fatal 误判。
 
+### 临时网络故障必须全局熔断并限制并发
+一次 DNS 故障会让 Apple Mail 的 SELECT/STATUS、后台邮件轮询和日历轮询同时醒来；逐文件夹
+独立重试会在同一秒把故障放大。所有邮件/日历 Sync 共享 4 个并发槽，并对 DNS、超时、
+EOF、HTTP 429/5xx 使用 5s→30s→2m→5m 的全局短退避。同步成功即清零。轮询使用按
+folderID 稳定生成的微小 jitter，避免所有文件夹整点齐发。
+
+IMAP 读路径可在临时故障或全局退避时返回已完成过同步的本地缓存；但“从未同步、空缓存”
+必须继续报错，否则客户端会把远端真实邮箱误判为一个成功同步的空邮箱。EAS HTTP 客户端和
+SMTP SendMail 均有 2 分钟上游超时，SMTP 连接读写期限为 5 分钟。
+
+IMAP 每 10 分钟记录 `imap_active`、`imap_total`、`imap_high_water` 和 goroutine 数。文件
+描述符里出现 `CLOSED` socket 不等于已经确认连接泄漏；先用这些会话计数和可复现的连接压测
+判断，再决定是否修改上游 go-imap 生命周期。
+
 ### 后台任务必须绑定 daemon 生命周期
 CalDAV stale-while-revalidate、邮件/日历 poller 和 MIME 缓存修剪都必须派生自 main
 的根 `ctx`。请求级 context 只控制当前客户端请求；`context.Background()` 会让后台刷新在
@@ -88,8 +102,13 @@ SIGTERM 后继续访问 EAS/state。缓存修剪同样要在 ctx 取消后停止
 ### FetchAttachment 明确无数据时要退避
 Coremail 偶尔会为已声明的 FileReference 返回成功响应但不含 Data。Apple Mail 会重复
 请求同一个 MIME part；如果每次都直打 EAS，会形成每分钟一次的无效下载。只对
-`FetchAttachment: no data in response` 做纯内存 1m→5m→15m→1h 退避；普通网络错误
+`FetchAttachment: no data in response` 做纯内存 1m→5m→15m→1h→6h→24h 退避；第一次
+缺失先重新 Fetch 邮件元数据，若 FileReference 已轮换则立即用新引用重试。普通网络错误
 仍立即重试，成功后清除退避，且任何失败都不得写入附件缓存。
+
+附件数据缺失不能让 BODYSTRUCTURE / RFC822.SIZE 失败。未知尺寸附件估算时把缺失内容按空
+数据处理，只影响实际打开/保存该附件；Apple Mail 重复请求同一退避中的 part 时，go-imap
+错误日志最多每小时记录一次。
 
 ## 三、架构不变量
 

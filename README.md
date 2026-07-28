@@ -14,10 +14,11 @@ Apple 日历 ─CalDAV :8008──┘
 - **SMTP**（默认 `127.0.0.1:1025`）：AUTH PLAIN，MIME 原样透传到 EAS SendMail（服务器自动存已发送）
 - **CalDAV**（默认 `127.0.0.1:8008`）：日历只读桥——Basic Auth、calendar-query time-range 过滤、**循环事件 RRULE 原生透传**（客户端自行展开）、VALARM 提醒、组织者/参与人、全天事件、取消状态
 - **增量同步**：EAS Sync 增量拉取，默认 60s 轮询全部邮件文件夹（每轮重读列表，新文件夹自动纳入）；邮件与日历后台预热，日历缓存过期后异步刷新
-- **异常同步保护**：Status 5 故障和日历重复分页分别指数退避；本地缓存持续服务，真实同步恢复后自动清零
+- **弱网与异常同步保护**：EAS 同步最多 4 路并发；DNS、超时、HTTP 429/5xx 等临时故障触发全局熔断，Status 5 和日历重复分页各自退避；已同步文件夹在远端不可用时继续提供本地缓存
 - **UID 稳定映射**：serverID ↔ IMAP UID 持久化，1-based 单调递增，UIDVALIDITY 时间戳（state 重置自动升位）
 - **完整邮件呈现**：优先透传原始 MIME；Coremail 不返回 MIME 时自动用纯文本 + HTML、内嵌图片和普通附件重建标准 multipart 邮件
-- **按需附件与缓存**：LIST / BODYSTRUCTURE / RFC822.SIZE 不预下载已知大小的附件，读取单个 MIME part 时只取对应附件；缓存采用并发去重、原子写入及 1 GiB / 30 天淘汰策略；服务器明确不返回附件数据时指数退避，避免客户端轮询形成请求风暴
+- **按需附件与缓存**：LIST / BODYSTRUCTURE / RFC822.SIZE 不预下载附件，读取单个 MIME part 时只取对应附件；失效 FileReference 会先刷新邮件元数据并立即重试，暂时无数据时按 1m→5m→15m→1h→6h→24h 退避，但不影响邮件列表和结构展示；缓存采用并发去重、原子写入及 1 GiB / 30 天淘汰策略
+- **运行保护与观测**：上游 HTTP/发信都有超时，SMTP 连接有读写期限；日志每 10 分钟输出 IMAP 活跃连接、累计连接、峰值和 goroutine 数，便于发现客户端重连风暴
 - **文件夹兼容**：仅向 IMAP 暴露邮件文件夹；自定义文件夹保留层级，重名文件夹生成稳定且可选择的名称
 - **安全**：只绑回环地址（非回环拒绝启动）；凭据仅本地 config，0600 权限
 - **Coremail 兼容**：EAS 不返回原始 MIME 时，自动降级请求 HTML/纯文本并构造合法 RFC822
@@ -123,12 +124,13 @@ tail -f ~/Library/Logs/eas-bridge.log      # 看日志
 - COPY 实为移动（EAS 无服务端复制语义，与 DavMail 一致）；APPEND 不支持
 - SEARCH 支持 SUBJECT/FROM/TO/CC 等头部、日期、尺寸、标志位、NOT/OR 组合；TEXT/BODY 只覆盖已缓存正文（读过的邮件），未缓存的正文不参与匹配（Apple Mail 全文搜索走本地索引，不受影响）；不支持 \Answered/\Draft 标志（服务器无此数据）
 - 已读回推失败时不重试（本地状态保留，下次增量同步收敛）
+- 弱网时只有已经完成过同步的邮件文件夹可以离线读取；首次打开且没有任何同步状态的空文件夹仍会返回上游错误
 - **日历写入被服务器拒绝**：Coremail 对日历文件夹的上行 Sync 命令一律回 Status 5（实测 Add/Change 跨协议版本 12.1/14.0/14.1 均拒绝，邮件上行正常）——代码已完整实现创建/更新/删除，但服务器策略使日历实为只读，写操作会收到 403 及明确提示；若服务器策略变更则自动可用
 
 ## Roadmap
 
-- SEARCH 支持 SUBJECT/FROM 等常用条件
-- 日历写操作（EAS CreateEvent/UpdateEvent/DeleteEvent）
+- 已读/标记回推的持久化重试队列
+- 可选本地 TLS 与多账户运行模式
 - 循环修改型例外 → RECURRENCE-ID 覆盖事件
 
 ## License

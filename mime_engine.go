@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +22,7 @@ type attachmentBackoff struct {
 	failures  int
 	nextRetry time.Time
 	cause     error
+	refreshed bool
 }
 
 type attachmentBackoffError struct {
@@ -41,6 +43,8 @@ var attachmentBackoffSteps = []time.Duration{
 	5 * time.Minute,
 	15 * time.Minute,
 	time.Hour,
+	6 * time.Hour,
+	24 * time.Hour,
 }
 
 type cachedMessageMetadata struct {
@@ -204,7 +208,14 @@ func (plan *messagePlan) estimatedMIME(ctx context.Context, engine *syncEngine) 
 			actualAttachments: unknownSizes,
 			estimatedPayloads: true,
 			resolveAttachment: func(index int) ([]byte, error) {
-				return engine.fetchAttachmentCached(ctx, plan.folderID, plan.serverID, plan.item.Attachments[index])
+				data, err := engine.fetchAttachmentCached(ctx, plan.folderID, plan.serverID, plan.item.Attachments[index])
+				if isAttachmentNoDataError(err) {
+					// BODYSTRUCTURE/RFC822.SIZE describe message shape. One
+					// temporarily unavailable unknown-size attachment must not
+					// make the whole metadata FETCH fail.
+					return nil, nil
+				}
+				return data, err
 			},
 		})
 	})
@@ -314,6 +325,28 @@ func (e *syncEngine) fetchAttachmentCached(ctx context.Context, folderID, server
 		}
 		data, fetchErr := e.downloadAttachment(ctx, meta)
 		if fetchErr != nil {
+			if isAttachmentNoDataError(fetchErr) && e.markAttachmentMetadataRefreshed(key) {
+				refreshed, changed, refreshErr := e.refreshAttachmentMetadata(ctx, folderID, serverID, meta)
+				if refreshErr != nil {
+					log.Printf("[mime] 刷新附件元数据失败，继续按原引用退避: %v", refreshErr)
+				} else if changed {
+					log.Printf("[mime] 附件 FileReference 已刷新，立即重试下载")
+					data, fetchErr = e.downloadAttachment(ctx, refreshed)
+					if fetchErr == nil {
+						e.clearAttachmentBackoff(key)
+						if writeErr := atomicWriteFile(path, data, 0600); writeErr != nil {
+							log.Printf("[mime] 写附件缓存失败: %v", writeErr)
+						}
+						refreshedPath := attachmentCachePath(folderID, serverID, refreshed.FileReference)
+						if refreshedPath != path {
+							if writeErr := atomicWriteFile(refreshedPath, data, 0600); writeErr != nil {
+								log.Printf("[mime] 写刷新引用的附件缓存失败: %v", writeErr)
+							}
+						}
+						return data, nil
+					}
+				}
+			}
 			e.trackAttachmentFailure(key, fetchErr)
 			return nil, fetchErr
 		}
@@ -331,6 +364,107 @@ func (e *syncEngine) fetchAttachmentCached(ctx context.Context, folderID, server
 
 func isAttachmentNoDataError(err error) bool {
 	return errors.Is(err, eas.ErrAttachmentDataMissing)
+}
+
+func (e *syncEngine) markAttachmentMetadataRefreshed(key string) bool {
+	e.attachmentBackoffMu.Lock()
+	defer e.attachmentBackoffMu.Unlock()
+	state := e.attachmentBackoff[key]
+	if state.refreshed {
+		return false
+	}
+	state.refreshed = true
+	if e.attachmentBackoff == nil {
+		e.attachmentBackoff = map[string]attachmentBackoff{}
+	}
+	e.attachmentBackoff[key] = state
+	return true
+}
+
+func (e *syncEngine) refreshAttachmentMetadata(
+	ctx context.Context,
+	folderID, serverID string,
+	previous eas.Attachment,
+) (eas.Attachment, bool, error) {
+	if e.st == nil {
+		return eas.Attachment{}, false, errors.New("同步状态不可用")
+	}
+	summary, ok := e.cachedEmailItem(folderID, serverID)
+	if !ok {
+		return eas.Attachment{}, false, fmt.Errorf("邮件不存在: %s", serverID)
+	}
+	folder, ok := e.findFolder(folderID)
+	if !ok {
+		return eas.Attachment{}, false, fmt.Errorf("不存在的文件夹: %s", folderID)
+	}
+	source, err := fetchMessageSource(ctx, e.c, folder.ServerID, serverID, summary)
+	if err != nil {
+		return eas.Attachment{}, false, err
+	}
+	if len(source.RawMIME) > 0 {
+		if err := atomicWriteFile(messageRawMIMEPath(folderID, serverID), source.RawMIME, 0600); err != nil {
+			log.Printf("[mime] 写刷新后的原始 MIME 缓存失败: %v", err)
+		}
+	}
+	refreshed, matched := findRefreshedAttachment(previous, source.Item.Attachments)
+	changed := matched && refreshed.FileReference != "" && refreshed.FileReference != previous.FileReference
+	if changed {
+		attachments := make([]eas.Attachment, 0, len(source.Item.Attachments))
+		for _, attachment := range source.Item.Attachments {
+			if attachment.FileReference != previous.FileReference {
+				attachments = append(attachments, attachment)
+			}
+		}
+		source.Item.Attachments = attachments
+	}
+	if source.Complete && len(source.RawMIME) == 0 {
+		metadata, err := json.Marshal(cachedMessageMetadata{Item: source.Item, PlainBody: source.PlainBody})
+		if err != nil {
+			return eas.Attachment{}, false, err
+		}
+		if err := atomicWriteFile(messageMetadataPath(folderID, serverID), metadata, 0600); err != nil {
+			log.Printf("[mime] 写刷新后的邮件元数据缓存失败: %v", err)
+		}
+	}
+	if !changed {
+		return eas.Attachment{}, false, nil
+	}
+	return refreshed, true, nil
+}
+
+func findRefreshedAttachment(previous eas.Attachment, candidates []eas.Attachment) (eas.Attachment, bool) {
+	bestScore := 0
+	var best eas.Attachment
+	ambiguous := false
+	for _, candidate := range candidates {
+		if candidate.FileReference == previous.FileReference {
+			continue
+		}
+		score := 0
+		switch {
+		case previous.ContentID != "" &&
+			strings.EqualFold(normalizeContentID(previous.ContentID), normalizeContentID(candidate.ContentID)):
+			score = 4
+		case previous.DisplayName != "" &&
+			previous.DisplayName == candidate.DisplayName &&
+			previous.EstimatedDataSize > 0 &&
+			previous.EstimatedDataSize == candidate.EstimatedDataSize:
+			score = 3
+		case previous.DisplayName != "" &&
+			previous.DisplayName == candidate.DisplayName &&
+			previous.ContentType != "" &&
+			strings.EqualFold(previous.ContentType, candidate.ContentType):
+			score = 2
+		}
+		if score > bestScore {
+			bestScore = score
+			best = candidate
+			ambiguous = false
+		} else if score > 0 && score == bestScore {
+			ambiguous = true
+		}
+	}
+	return best, bestScore > 0 && !ambiguous
 }
 
 func (e *syncEngine) trackAttachmentFailure(key string, err error) {
@@ -368,6 +502,17 @@ func (e *syncEngine) attachmentBackoffError(key string) error {
 func (e *syncEngine) clearAttachmentBackoff(key string) {
 	e.attachmentBackoffMu.Lock()
 	delete(e.attachmentBackoff, key)
+	e.attachmentBackoffMu.Unlock()
+}
+
+func (e *syncEngine) clearAttachmentBackoffsForMessage(folderID, serverID string) {
+	prefix := "attachment:" + folderID + "\x00" + serverID + "\x00"
+	e.attachmentBackoffMu.Lock()
+	for key := range e.attachmentBackoff {
+		if strings.HasPrefix(key, prefix) {
+			delete(e.attachmentBackoff, key)
+		}
+	}
 	e.attachmentBackoffMu.Unlock()
 }
 
@@ -414,6 +559,7 @@ func (e *syncEngine) downloadAttachment(ctx context.Context, meta eas.Attachment
 
 func (e *syncEngine) invalidateMessageCache(folderID string, serverIDs ...string) {
 	for _, serverID := range serverIDs {
+		e.clearAttachmentBackoffsForMessage(folderID, serverID)
 		if err := removeMessageCache(folderID, serverID); err != nil {
 			log.Printf("[mime] 清理邮件缓存失败: %v", err)
 		}

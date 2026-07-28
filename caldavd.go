@@ -213,7 +213,10 @@ func (b *caldavBackend) syncCalendar(ctx context.Context) error {
 }
 
 func normalizeCalendarSyncError(err error) error {
-	if errors.Is(err, ErrSyncBackoffSkip) || errors.Is(err, ErrCalendarReplayBackoffSkip) {
+	var transientErr *transientBackoffError
+	if errors.Is(err, ErrSyncBackoffSkip) ||
+		errors.Is(err, ErrCalendarReplayBackoffSkip) ||
+		errors.As(err, &transientErr) {
 		return nil // 退避跳过不是故障，lastCalSync 不推进（下轮轮询会再试）
 	}
 	return err

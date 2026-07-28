@@ -5,7 +5,10 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"reflect"
 	"sort"
@@ -20,6 +23,8 @@ const (
 	asVersion                  = "14.0"
 	maxCalendarNoProgressPages = 3
 	maxCalendarStableAliases   = 8
+	maxConcurrentEASSyncs      = 4
+	easRequestTimeout          = 2 * time.Minute
 )
 
 // syncEngine 封装 EAS 客户端与同步状态。
@@ -37,6 +42,15 @@ type syncEngine struct {
 
 	calendarReplayMu      sync.Mutex
 	calendarReplayBackoff folderBackoff
+
+	transientMu      sync.Mutex
+	transientBackoff transientEASBackoff
+
+	syncGateMu sync.Mutex
+	syncGate   chan struct{}
+
+	staleMailLogMu sync.Mutex
+	staleMailLog   map[string]time.Time
 }
 
 // folderBackoff 记录单个同步通道（邮件文件夹/日历）的连续 Status 5 退避状态。
@@ -44,6 +58,26 @@ type folderBackoff struct {
 	failures    int
 	nextRetry   time.Time
 	lastSkipLog time.Time
+}
+
+type transientEASBackoff struct {
+	failures    int
+	nextRetry   time.Time
+	lastSkipLog time.Time
+	lastErr     error
+}
+
+type transientBackoffError struct {
+	retryAfter time.Duration
+	cause      error
+}
+
+func (e *transientBackoffError) Error() string {
+	return fmt.Sprintf("EAS 临时故障退避中，约 %s 后重试: %v", e.retryAfter.Round(time.Second), e.cause)
+}
+
+func (e *transientBackoffError) Unwrap() error {
+	return e.cause
 }
 
 // syncBackoffSteps 连续第 N 次 Status 5 后的退避时长（超出最后一档按封顶值）。
@@ -62,6 +96,13 @@ var calendarReplayBackoffSteps = []time.Duration{
 	5 * time.Minute,
 	15 * time.Minute,
 	30 * time.Minute,
+}
+
+var transientEASBackoffSteps = []time.Duration{
+	5 * time.Second,
+	30 * time.Second,
+	2 * time.Minute,
+	5 * time.Minute,
 }
 
 // backoffRemaining 返回 key 当前剩余的退避时间（0 表示可以同步）。
@@ -118,6 +159,87 @@ func (e *syncEngine) trackSyncResult(key string, err error) {
 	log.Printf("[sync] %s 连续第 %d 次 Status 5，退避 %s 后重试", key, b.failures, step)
 }
 
+func isTransientEASError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	var httpErr *eas.HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.StatusCode == http.StatusTooManyRequests || httpErr.StatusCode >= 500
+	}
+	return false
+}
+
+func (e *syncEngine) trackTransientEASResult(err error) {
+	e.transientMu.Lock()
+	defer e.transientMu.Unlock()
+	if err == nil {
+		e.transientBackoff = transientEASBackoff{}
+		return
+	}
+	if !isTransientEASError(err) {
+		return
+	}
+	now := time.Now()
+	// Several folder requests may already be in flight when the first global
+	// failure opens the breaker. Treat their near-simultaneous failures as one
+	// outage observation instead of jumping several backoff levels at once.
+	if now.Before(e.transientBackoff.nextRetry) {
+		e.transientBackoff.lastErr = err
+		return
+	}
+	e.transientBackoff.failures++
+	step := transientEASBackoffSteps[min(e.transientBackoff.failures, len(transientEASBackoffSteps))-1]
+	e.transientBackoff.nextRetry = now.Add(step)
+	e.transientBackoff.lastErr = err
+	log.Printf("[sync] EAS 临时故障连续第 %d 次，全局退避 %s: %v", e.transientBackoff.failures, step, err)
+}
+
+func (e *syncEngine) transientBackoffError() error {
+	e.transientMu.Lock()
+	defer e.transientMu.Unlock()
+	remaining := time.Until(e.transientBackoff.nextRetry)
+	if remaining <= 0 {
+		return nil
+	}
+	if time.Since(e.transientBackoff.lastSkipLog) >= time.Minute {
+		e.transientBackoff.lastSkipLog = time.Now()
+		log.Printf("[sync] EAS 临时故障退避中（剩余 ~%s），本轮不访问远端", remaining.Round(time.Second))
+	}
+	return &transientBackoffError{retryAfter: remaining, cause: e.transientBackoff.lastErr}
+}
+
+func (e *syncEngine) acquireSyncSlot(ctx context.Context) error {
+	e.syncGateMu.Lock()
+	if e.syncGate == nil {
+		e.syncGate = make(chan struct{}, maxConcurrentEASSyncs)
+	}
+	gate := e.syncGate
+	e.syncGateMu.Unlock()
+	select {
+	case gate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (e *syncEngine) releaseSyncSlot() {
+	e.syncGateMu.Lock()
+	gate := e.syncGate
+	e.syncGateMu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+}
+
 func newSyncEngine(cfg *config) (*syncEngine, error) {
 	st, err := loadState(statePath())
 	if err != nil {
@@ -169,6 +291,7 @@ func newSyncEngine(cfg *config) (*syncEngine, error) {
 		DeviceType: "eas-bridge",
 		ASVersion:  asVersion,
 		State:      st,
+		HTTPClient: &http.Client{Timeout: easRequestTimeout},
 	})
 	if err != nil {
 		return nil, err
@@ -182,6 +305,7 @@ func newSyncEngine(cfg *config) (*syncEngine, error) {
 		c:                 c,
 		backoff:           map[string]folderBackoff{},
 		attachmentBackoff: map[string]attachmentBackoff{},
+		staleMailLog:      map[string]time.Time{},
 	}
 	return engine, nil
 }
@@ -223,13 +347,66 @@ func (e *syncEngine) syncMail(ctx context.Context, folderID string) error {
 	if e.skipBackoff(key) {
 		return nil // 退避期：本轮跳过，本地 state 照常服务 IMAP 读
 	}
+	if err := e.transientBackoffError(); err != nil {
+		return err
+	}
 	_, err := e.flights.DoContext(ctx, "sync-mail:"+folderID, func() (any, error) {
+		if err := e.acquireSyncSlot(ctx); err != nil {
+			return nil, err
+		}
+		defer e.releaseSyncSlot()
+		if err := e.transientBackoffError(); err != nil {
+			return nil, err
+		}
 		// trackSyncResult 放 flight 内：并发调用合并为一次执行，失败只计一次
 		err := e.syncMailOnce(ctx, folderID)
 		e.trackSyncResult(key, err)
+		e.trackTransientEASResult(err)
 		return nil, err
 	})
 	return err
+}
+
+func (e *syncEngine) hasUsableMailCache(folderID string) bool {
+	e.st.mu.Lock()
+	defer e.st.mu.Unlock()
+	if len(e.st.Items[folderID]) > 0 {
+		return true
+	}
+	key := e.st.SyncKeys[folderID]
+	return key != "" && key != "0"
+}
+
+func canServeStaleMail(err error) bool {
+	if err == nil {
+		return false
+	}
+	var transientErr *transientBackoffError
+	return errors.As(err, &transientErr) ||
+		isTransientEASError(err) ||
+		eas.IsStatusCode(err, 5)
+}
+
+// syncMailForRead provides stale-on-error semantics for IMAP metadata reads.
+// A temporary upstream outage must not make already cached mail disappear or
+// prevent Mail from opening a mailbox. Truly unsynchronized empty folders still
+// return the original error so the client never treats an outage as an empty box.
+func (e *syncEngine) syncMailForRead(ctx context.Context, folderID string) error {
+	err := e.syncMail(ctx, folderID)
+	if err == nil || !canServeStaleMail(err) || !e.hasUsableMailCache(folderID) {
+		return err
+	}
+	e.staleMailLogMu.Lock()
+	last := e.staleMailLog[folderID]
+	if time.Since(last) >= 10*time.Minute {
+		if e.staleMailLog == nil {
+			e.staleMailLog = map[string]time.Time{}
+		}
+		e.staleMailLog[folderID] = time.Now()
+		log.Printf("[imapd] 文件夹 %s 同步失败，继续使用本地缓存: %v", folderID, err)
+	}
+	e.staleMailLogMu.Unlock()
+	return nil
 }
 
 func (e *syncEngine) syncMailOnce(ctx context.Context, folderID string) error {
@@ -415,9 +592,20 @@ func (e *syncEngine) syncCalendar(ctx context.Context) error {
 	if e.skipCalendarReplayBackoff() {
 		return ErrCalendarReplayBackoffSkip
 	}
+	if err := e.transientBackoffError(); err != nil {
+		return err
+	}
 	_, err := e.flights.DoContext(ctx, "sync-calendar", func() (any, error) {
+		if err := e.acquireSyncSlot(ctx); err != nil {
+			return nil, err
+		}
+		defer e.releaseSyncSlot()
+		if err := e.transientBackoffError(); err != nil {
+			return nil, err
+		}
 		err := e.syncCalendarOnce(ctx)
 		e.trackSyncResult(key, err)
+		e.trackTransientEASResult(err)
 		return nil, err
 	})
 	return err
@@ -1023,9 +1211,19 @@ func (e *syncEngine) poller(ctx context.Context, interval time.Duration, onChang
 				wg.Add(1)
 				go func(fid string) {
 					defer wg.Done()
+					if jitter := stablePollJitter(fid, interval); jitter > 0 {
+						timer := time.NewTimer(jitter)
+						defer timer.Stop()
+						select {
+						case <-ctx.Done():
+							return
+						case <-timer.C:
+						}
+					}
 					if err := e.syncMail(ctx, fid); err != nil {
 						// 单文件夹失败不影响其他文件夹；临时网络错误静默，持续错误记日志但不崩溃
-						if !errors.Is(err, context.Canceled) {
+						var transientErr *transientBackoffError
+						if !errors.Is(err, context.Canceled) && !errors.As(err, &transientErr) {
 							log.Printf("[poll] syncMail %s: %v", fid, err)
 						}
 						return
@@ -1036,4 +1234,19 @@ func (e *syncEngine) poller(ctx context.Context, interval time.Duration, onChang
 			wg.Wait()
 		}
 	}
+}
+
+func stablePollJitter(key string, interval time.Duration) time.Duration {
+	maxJitter := min(interval/10, 10*time.Second)
+	if maxJitter <= 0 {
+		return 0
+	}
+	// Stable FNV-1a keeps folders spread across each polling window without
+	// making tests or operational timing nondeterministic.
+	var hash uint64 = 1469598103934665603
+	for i := 0; i < len(key); i++ {
+		hash ^= uint64(key[i])
+		hash *= 1099511628211
+	}
+	return time.Duration(hash % uint64(maxJitter))
 }
