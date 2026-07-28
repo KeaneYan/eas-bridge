@@ -14,9 +14,10 @@ Apple 日历 ─CalDAV :8008──┘
 - **SMTP**（默认 `127.0.0.1:1025`）：AUTH PLAIN，MIME 原样透传到 EAS SendMail（服务器自动存已发送）
 - **CalDAV**（默认 `127.0.0.1:8008`）：日历只读桥——Basic Auth、calendar-query time-range 过滤、**循环事件 RRULE 原生透传**（客户端自行展开）、VALARM 提醒、组织者/参与人、全天事件、取消状态
 - **增量同步**：EAS Sync 增量拉取，默认 60s 轮询全部邮件文件夹（每轮重读列表，新文件夹自动纳入）；邮件与日历后台预热，日历缓存过期后异步刷新
+- **异常同步保护**：Status 5 故障和日历重复分页分别指数退避；本地缓存持续服务，真实同步恢复后自动清零
 - **UID 稳定映射**：serverID ↔ IMAP UID 持久化，1-based 单调递增，UIDVALIDITY 时间戳（state 重置自动升位）
 - **完整邮件呈现**：优先透传原始 MIME；Coremail 不返回 MIME 时自动用纯文本 + HTML、内嵌图片和普通附件重建标准 multipart 邮件
-- **按需附件与缓存**：LIST / BODYSTRUCTURE / RFC822.SIZE 不预下载已知大小的附件，读取单个 MIME part 时只取对应附件；缓存采用并发去重、原子写入及 1 GiB / 30 天淘汰策略
+- **按需附件与缓存**：LIST / BODYSTRUCTURE / RFC822.SIZE 不预下载已知大小的附件，读取单个 MIME part 时只取对应附件；缓存采用并发去重、原子写入及 1 GiB / 30 天淘汰策略；服务器明确不返回附件数据时指数退避，避免客户端轮询形成请求风暴
 - **文件夹兼容**：仅向 IMAP 暴露邮件文件夹；自定义文件夹保留层级，重名文件夹生成稳定且可选择的名称
 - **安全**：只绑回环地址（非回环拒绝启动）；凭据仅本地 config，0600 权限
 - **Coremail 兼容**：EAS 不返回原始 MIME 时，自动降级请求 HTML/纯文本并构造合法 RFC822
@@ -43,11 +44,14 @@ go build -o eas-bridge .
   "imap_addr": "127.0.0.1:1143",
   "smtp_addr": "127.0.0.1:1025",
   "caldav_addr": "127.0.0.1:8008",
-  "poll_seconds": 60
+  "poll_seconds": 60,
+  "calendar_poll_seconds": 60
 }
 ```
 
-`poll_seconds` 同时控制邮件和日历的后台同步间隔；默认 60 秒。日历会独立定时拉取，不需要保持 Apple 日历处于打开状态。
+`poll_seconds` 控制邮件后台同步间隔，默认 60 秒；`calendar_poll_seconds`
+单独控制日历，省略或设为非正数时沿用 `poll_seconds`，因此旧配置无需迁移。
+日历会独立定时拉取，不需要保持 Apple 日历处于打开状态。
 
 ## 后台常驻（launchd，推荐）
 

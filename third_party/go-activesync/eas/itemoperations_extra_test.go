@@ -6,6 +6,7 @@ package eas
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 
@@ -480,8 +481,8 @@ func TestFetchAttachment_noData(t *testing.T) {
 		w.Header().Set("Content-Type", "application/vnd.ms-sync.wbxml")
 		w.Write(body)
 	})
-	if _, err := c.FetchAttachment(context.Background(), "ref", 0, 0); err == nil {
-		t.Error("want no-data error")
+	if _, err := c.FetchAttachment(context.Background(), "ref", 0, 0); !errors.Is(err, ErrAttachmentDataMissing) {
+		t.Errorf("error = %v, want ErrAttachmentDataMissing", err)
 	}
 }
 

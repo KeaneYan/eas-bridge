@@ -31,6 +31,12 @@ type syncEngine struct {
 
 	backoffMu sync.Mutex
 	backoff   map[string]folderBackoff
+
+	attachmentBackoffMu sync.Mutex
+	attachmentBackoff   map[string]attachmentBackoff
+
+	calendarReplayMu      sync.Mutex
+	calendarReplayBackoff folderBackoff
 }
 
 // folderBackoff 记录单个同步通道（邮件文件夹/日历）的连续 Status 5 退避状态。
@@ -46,6 +52,13 @@ type folderBackoff struct {
 // 摧毁本地同步状态。退避把故障期的重拉频率压到最多 2 次/小时/文件夹。
 var syncBackoffSteps = []time.Duration{
 	1 * time.Minute,
+	5 * time.Minute,
+	15 * time.Minute,
+	30 * time.Minute,
+}
+
+var calendarReplayBackoffSteps = []time.Duration{
+	time.Minute,
 	5 * time.Minute,
 	15 * time.Minute,
 	30 * time.Minute,
@@ -163,8 +176,13 @@ func newSyncEngine(cfg *config) (*syncEngine, error) {
 	if err := c.Provision(context.Background()); err != nil {
 		return nil, fmt.Errorf("Provision: %w", err)
 	}
-	engine := &syncEngine{cfg: cfg, st: st, c: c, backoff: map[string]folderBackoff{}}
-	engine.scheduleCachePrune()
+	engine := &syncEngine{
+		cfg:               cfg,
+		st:                st,
+		c:                 c,
+		backoff:           map[string]folderBackoff{},
+		attachmentBackoff: map[string]attachmentBackoff{},
+	}
 	return engine, nil
 }
 
@@ -383,12 +401,19 @@ func (e *syncEngine) findFolder(folderID string) (eas.Folder, bool) {
 // 用它区分"跳过"与"成功"，lastCalSync 只在真成功时推进（ZCode backoff M-2）。
 var ErrSyncBackoffSkip = errors.New("Status 5 退避期，本次日历同步跳过")
 
+// ErrCalendarReplayBackoffSkip 表示日历因连续的异常重复分页而暂缓拉取。
+// 与 Status 5 退避相同，CalDAV 应继续用本地缓存服务，但不能把跳过当作真实成功。
+var ErrCalendarReplayBackoffSkip = errors.New("日历重复分页退避期，本次同步跳过")
+
 // syncCalendar 增量同步日历事件到 st.Events（synckey 由库自动持久化）。
 // 首次全量显式请求 EAS 支持的最大六个月窗口，之后靠 synckey 增量。
 func (e *syncEngine) syncCalendar(ctx context.Context) error {
 	const key = "calendar"
 	if e.skipBackoff(key) {
 		return ErrSyncBackoffSkip // 退避期：本地事件缓存照常服务 CalDAV 读
+	}
+	if e.skipCalendarReplayBackoff() {
+		return ErrCalendarReplayBackoffSkip
 	}
 	_, err := e.flights.DoContext(ctx, "sync-calendar", func() (any, error) {
 		err := e.syncCalendarOnce(ctx)
@@ -447,6 +472,7 @@ func (e *syncEngine) syncCalendarOnce(ctx context.Context) error {
 	retried := false
 	var pending calendarMutations
 	noProgressPages := 0
+	roundProgress := false
 	for page := 0; page < 100; page++ {
 		res, err := e.c.SyncCalendar(ctx, calFolderID, eas.CalendarSyncOptions{
 			WindowSize: 100,
@@ -498,6 +524,7 @@ func (e *syncEngine) syncCalendarOnce(ctx context.Context) error {
 		}
 		if pageProgress {
 			noProgressPages = 0
+			roundProgress = true
 		} else {
 			noProgressPages++
 		}
@@ -515,6 +542,7 @@ func (e *syncEngine) syncCalendarOnce(ctx context.Context) error {
 			return saveErr
 		}
 		if !res.MoreAvailable {
+			e.trackCalendarReplayResult(false)
 			return nil
 		}
 		if stalled {
@@ -522,11 +550,59 @@ func (e *syncEngine) syncCalendarOnce(ctx context.Context) error {
 			// saveCalendarLocked persisted it above. If duplicate-only pages
 			// precede a real change, the next polling pass resumes after these
 			// pages instead of replaying them forever.
-			log.Printf("[sync] 日历连续 %d 页没有逻辑变化，忽略异常的 MoreAvailable 并结束本轮同步", noProgressPages)
+			if roundProgress {
+				e.trackCalendarReplayResult(false)
+				log.Printf("[sync] 日历连续 %d 页没有后续变化，忽略异常的 MoreAvailable 并结束本轮同步", noProgressPages)
+			} else {
+				e.trackCalendarReplayResult(true)
+			}
 			return nil
 		}
 	}
 	return fmt.Errorf("日历同步超过 100 页仍未完成")
+}
+
+func (e *syncEngine) calendarReplayBackoffRemaining() time.Duration {
+	e.calendarReplayMu.Lock()
+	defer e.calendarReplayMu.Unlock()
+	if d := time.Until(e.calendarReplayBackoff.nextRetry); d > 0 {
+		return d
+	}
+	return 0
+}
+
+func (e *syncEngine) skipCalendarReplayBackoff() bool {
+	remaining := e.calendarReplayBackoffRemaining()
+	if remaining <= 0 {
+		return false
+	}
+	e.calendarReplayMu.Lock()
+	if time.Since(e.calendarReplayBackoff.lastSkipLog) >= 10*time.Minute {
+		e.calendarReplayBackoff.lastSkipLog = time.Now()
+		log.Printf(
+			"[sync] 日历异常重复分页退避中（剩余 ~%s），本轮跳过，本地事件照常服务",
+			remaining.Round(time.Second),
+		)
+	}
+	e.calendarReplayMu.Unlock()
+	return true
+}
+
+func (e *syncEngine) trackCalendarReplayResult(stalled bool) {
+	e.calendarReplayMu.Lock()
+	defer e.calendarReplayMu.Unlock()
+	if !stalled {
+		e.calendarReplayBackoff = folderBackoff{}
+		return
+	}
+	e.calendarReplayBackoff.failures++
+	step := calendarReplayBackoffSteps[min(e.calendarReplayBackoff.failures, len(calendarReplayBackoffSteps))-1]
+	e.calendarReplayBackoff.nextRetry = time.Now().Add(step)
+	log.Printf(
+		"[sync] 日历连续第 %d 轮只有重复分页，忽略异常的 MoreAvailable，退避 %s 后继续",
+		e.calendarReplayBackoff.failures,
+		step,
+	)
 }
 
 func calendarEventsEqualExceptServerID(a, b eas.EventItem) bool {

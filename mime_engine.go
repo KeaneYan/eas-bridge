@@ -17,6 +17,32 @@ import (
 
 const attachmentChunkSize = int64(4 << 20)
 
+type attachmentBackoff struct {
+	failures  int
+	nextRetry time.Time
+	cause     error
+}
+
+type attachmentBackoffError struct {
+	retryAfter time.Duration
+	cause      error
+}
+
+func (e *attachmentBackoffError) Error() string {
+	return fmt.Sprintf("附件暂不可用，约 %s 后重试: %v", e.retryAfter.Round(time.Second), e.cause)
+}
+
+func (e *attachmentBackoffError) Unwrap() error {
+	return e.cause
+}
+
+var attachmentBackoffSteps = []time.Duration{
+	time.Minute,
+	5 * time.Minute,
+	15 * time.Minute,
+	time.Hour,
+}
+
 type cachedMessageMetadata struct {
 	Item      eas.EmailItem `json:"item"`
 	PlainBody string        `json:"plain_body,omitempty"`
@@ -280,12 +306,18 @@ func (e *syncEngine) fetchAttachmentCached(ctx context.Context, folderID, server
 	key := "attachment:" + folderID + "\x00" + serverID + "\x00" + meta.FileReference
 	value, err := e.flights.DoContext(ctx, key, func() (any, error) {
 		if data, readErr := readCacheFile(path); readErr == nil {
+			e.clearAttachmentBackoff(key)
 			return data, nil
+		}
+		if backoffErr := e.attachmentBackoffError(key); backoffErr != nil {
+			return nil, backoffErr
 		}
 		data, fetchErr := e.downloadAttachment(ctx, meta)
 		if fetchErr != nil {
+			e.trackAttachmentFailure(key, fetchErr)
 			return nil, fetchErr
 		}
+		e.clearAttachmentBackoff(key)
 		if writeErr := atomicWriteFile(path, data, 0600); writeErr != nil {
 			log.Printf("[mime] 写附件缓存失败: %v", writeErr)
 		}
@@ -295,6 +327,48 @@ func (e *syncEngine) fetchAttachmentCached(ctx context.Context, folderID, server
 		return nil, err
 	}
 	return value.([]byte), nil
+}
+
+func isAttachmentNoDataError(err error) bool {
+	return errors.Is(err, eas.ErrAttachmentDataMissing)
+}
+
+func (e *syncEngine) trackAttachmentFailure(key string, err error) {
+	if !isAttachmentNoDataError(err) {
+		return
+	}
+	e.attachmentBackoffMu.Lock()
+	defer e.attachmentBackoffMu.Unlock()
+	state := e.attachmentBackoff[key]
+	state.failures++
+	step := attachmentBackoffSteps[min(state.failures, len(attachmentBackoffSteps))-1]
+	state.nextRetry = time.Now().Add(step)
+	state.cause = err
+	if e.attachmentBackoff == nil {
+		e.attachmentBackoff = map[string]attachmentBackoff{}
+	}
+	e.attachmentBackoff[key] = state
+	log.Printf("[mime] 附件服务器未返回数据，连续第 %d 次，退避 %s 后再请求", state.failures, step)
+}
+
+func (e *syncEngine) attachmentBackoffError(key string) error {
+	e.attachmentBackoffMu.Lock()
+	defer e.attachmentBackoffMu.Unlock()
+	state, ok := e.attachmentBackoff[key]
+	if !ok {
+		return nil
+	}
+	remaining := time.Until(state.nextRetry)
+	if remaining <= 0 {
+		return nil
+	}
+	return &attachmentBackoffError{retryAfter: remaining, cause: state.cause}
+}
+
+func (e *syncEngine) clearAttachmentBackoff(key string) {
+	e.attachmentBackoffMu.Lock()
+	delete(e.attachmentBackoff, key)
+	e.attachmentBackoffMu.Unlock()
 }
 
 // downloadAttachment 下载附件并返回解码后的原始字节。
@@ -346,10 +420,12 @@ func (e *syncEngine) invalidateMessageCache(folderID string, serverIDs ...string
 	}
 }
 
-// scheduleCachePrune 启动时立即修剪一次，之后每 24h 定期修剪，
-// 避免长运行 daemon 的 MIME 缓存在重启间隔内无界增长。
-func (e *syncEngine) scheduleCachePrune() {
+// scheduleCachePrune 启动时立即修剪一次，之后每 24h 定期修剪。
+// ctx 取消后协程退出，避免服务关闭后继续访问缓存与 state。
+func (e *syncEngine) scheduleCachePrune(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		prune := func() {
 			_, err := e.flights.Do("cache-prune", func() (any, error) {
 				return nil, pruneMIMECache(time.Now())
@@ -362,8 +438,14 @@ func (e *syncEngine) scheduleCachePrune() {
 		prune()
 		ticker := time.NewTicker(24 * time.Hour)
 		defer ticker.Stop()
-		for range ticker.C {
-			prune()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				prune()
+			}
 		}
 	}()
+	return done
 }

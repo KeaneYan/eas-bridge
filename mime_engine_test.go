@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/hstern/go-activesync/eas"
@@ -318,6 +319,59 @@ func TestFetchAttachmentCachedErrorNotCached(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Fatalf("FetchAttachment 调用 %d 次，want 2", calls)
+	}
+}
+
+func TestFetchAttachmentNoDataUsesBackoffAndRecovers(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	payload := []byte("attachment recovered")
+	meta := eas.Attachment{FileReference: "ref-no-data", EstimatedDataSize: int64(len(payload))}
+	calls := 0
+	engine := &syncEngine{c: &easmock.Client{
+		FolderClient: easmock.FolderClient{
+			FetchAttachmentFunc: func(context.Context, string, int64, int64) (*eas.FetchAttachmentResult, error) {
+				calls++
+				if calls == 1 {
+					return nil, eas.ErrAttachmentDataMissing
+				}
+				return &eas.FetchAttachmentResult{
+					Data: []byte(base64.StdEncoding.EncodeToString(payload)),
+				}, nil
+			},
+		},
+	}}
+
+	if _, err := engine.fetchAttachmentCached(context.Background(), "folder", "message", meta); err == nil {
+		t.Fatal("first fetch should report missing attachment data")
+	}
+	_, err := engine.fetchAttachmentCached(context.Background(), "folder", "message", meta)
+	var backoffErr *attachmentBackoffError
+	if !errors.As(err, &backoffErr) {
+		t.Fatalf("second fetch error = %v, want attachmentBackoffError", err)
+	}
+	if calls != 1 {
+		t.Fatalf("backoff should suppress remote fetch; calls = %d, want 1", calls)
+	}
+
+	key := "attachment:folder\x00message\x00ref-no-data"
+	engine.attachmentBackoffMu.Lock()
+	state := engine.attachmentBackoff[key]
+	state.nextRetry = time.Now().Add(-time.Second)
+	engine.attachmentBackoff[key] = state
+	engine.attachmentBackoffMu.Unlock()
+
+	got, err := engine.fetchAttachmentCached(context.Background(), "folder", "message", meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("recovered payload = %q, want %q", got, payload)
+	}
+	if calls != 2 {
+		t.Fatalf("expired backoff did not retry remote fetch; calls = %d, want 2", calls)
+	}
+	if err := engine.attachmentBackoffError(key); err != nil {
+		t.Fatalf("successful retry did not clear backoff: %v", err)
 	}
 }
 

@@ -9,13 +9,14 @@ import (
 )
 
 type config struct {
-	Server     string `json:"server"`
-	User       string `json:"user"`
-	Password   string `json:"password"`
-	IMAPAddr   string `json:"imap_addr"`    // 监听地址，默认 "127.0.0.1:1143"
-	SMTPAddr   string `json:"smtp_addr"`    // 监听地址，默认 "127.0.0.1:1025"
-	CalDAVAddr string `json:"caldav_addr"`  // 监听地址，默认 "127.0.0.1:8008"
-	PollSecs   int    `json:"poll_seconds"` // 邮件和日历同步间隔，默认 60
+	Server           string `json:"server"`
+	User             string `json:"user"`
+	Password         string `json:"password"`
+	IMAPAddr         string `json:"imap_addr"`             // 监听地址，默认 "127.0.0.1:1143"
+	SMTPAddr         string `json:"smtp_addr"`             // 监听地址，默认 "127.0.0.1:1025"
+	CalDAVAddr       string `json:"caldav_addr"`           // 监听地址，默认 "127.0.0.1:8008"
+	PollSecs         int    `json:"poll_seconds"`          // 邮件同步间隔，默认 60
+	CalendarPollSecs int    `json:"calendar_poll_seconds"` // 日历同步间隔，默认沿用 poll_seconds
 }
 
 func configDir() string {
@@ -57,6 +58,9 @@ func loadConfig() (*config, error) {
 	if cfg.PollSecs <= 0 {
 		cfg.PollSecs = 60
 	}
+	if cfg.CalendarPollSecs <= 0 {
+		cfg.CalendarPollSecs = cfg.PollSecs
+	}
 	return cfg, nil
 }
 
@@ -73,9 +77,11 @@ func isLoopbackAddr(addr string) bool {
 func initConfig() error {
 	os.MkdirAll(configDir(), 0700)
 	cfg := &config{
-		IMAPAddr: "127.0.0.1:1143",
-		SMTPAddr: "127.0.0.1:1025",
-		PollSecs: 60,
+		IMAPAddr:         "127.0.0.1:1143",
+		SMTPAddr:         "127.0.0.1:1025",
+		CalDAVAddr:       "127.0.0.1:8008",
+		PollSecs:         60,
+		CalendarPollSecs: 60,
 	}
 	b, _ := json.MarshalIndent(cfg, "", "  ")
 	if err := os.WriteFile(configPath(), b, 0600); err != nil {
