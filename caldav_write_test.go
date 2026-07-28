@@ -225,13 +225,15 @@ func TestParseICalDateTime(t *testing.T) {
 	if err != nil || !allDay || ts.Day() != 28 {
 		t.Fatalf("DATE: %v %v %v", ts, allDay, err)
 	}
-	// 浮点（本地时区，中国 +8 → UTC 减 8 小时）
+	// 浮点时间按运行环境的本地时区解释。CI 通常是 UTC，开发机可能是
+	// Asia/Shanghai；期望值不能硬编码为 +08:00。
 	ts, allDay, err = parseICalDateTime(mk("20260728T140000", ical.ValueDateTime))
 	if err != nil || allDay {
 		t.Fatalf("floating: %v %v %v", ts, allDay, err)
 	}
-	if ts.UTC().Hour() != 6 {
-		t.Fatalf("floating 14:00 +0800 应转 UTC 06:00, got %v", ts.UTC())
+	wantFloating := time.Date(2026, time.July, 28, 14, 0, 0, 0, time.Local)
+	if !ts.Equal(wantFloating) {
+		t.Fatalf("floating = %v, want local time %v", ts, wantFloating)
 	}
 }
 
