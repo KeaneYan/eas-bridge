@@ -19,6 +19,7 @@ import (
 const (
 	asVersion                  = "14.0"
 	maxCalendarNoProgressPages = 3
+	maxCalendarStableAliases   = 8
 )
 
 // syncEngine 封装 EAS 客户端与同步状态。
@@ -383,7 +384,7 @@ func (e *syncEngine) findFolder(folderID string) (eas.Folder, bool) {
 var ErrSyncBackoffSkip = errors.New("Status 5 退避期，本次日历同步跳过")
 
 // syncCalendar 增量同步日历事件到 st.Events（synckey 由库自动持久化）。
-// Coremail 忽略 FilterType，首次全量拉取后靠 synckey 增量。
+// 首次全量显式请求 EAS 支持的最大六个月窗口，之后靠 synckey 增量。
 func (e *syncEngine) syncCalendar(ctx context.Context) error {
 	const key = "calendar"
 	if e.skipBackoff(key) {
@@ -425,10 +426,15 @@ func (e *syncEngine) syncCalendarOnce(ctx context.Context) error {
 	// Directly constructed engines in tests and long-running processes upgraded
 	// in place may not have passed through newSyncEngine's startup repair.
 	e.st.mu.Lock()
-	duplicateEventIDs := dedupeEquivalentCalendarEventsLocked(e.st.Events)
+	duplicateEventIDs := dedupeEquivalentCalendarEventsLocked(e.st.Events, e.st.EventAliases)
 	var cleanupErr error
 	if len(duplicateEventIDs) > 0 {
-		cleanupErr = e.st.saveCalendarLocked(nil, duplicateEventIDs)
+		var cleanup calendarMutations
+		for _, id := range duplicateEventIDs {
+			cleanup.recordDelete(id)
+			cleanup.recordAlias(id, e.st.EventAliases[id])
+		}
+		cleanupErr = e.st.saveCalendarLocked(cleanup)
 	}
 	e.st.mu.Unlock()
 	if cleanupErr != nil {
@@ -439,11 +445,13 @@ func (e *syncEngine) syncCalendarOnce(ctx context.Context) error {
 	}
 
 	retried := false
-	var pendingUpserts []eas.EventItem
-	var pendingDeletes []string
+	var pending calendarMutations
 	noProgressPages := 0
 	for page := 0; page < 100; page++ {
-		res, err := e.c.SyncCalendar(ctx, calFolderID, eas.CalendarSyncOptions{WindowSize: 100})
+		res, err := e.c.SyncCalendar(ctx, calFolderID, eas.CalendarSyncOptions{
+			WindowSize: 100,
+			DateFilter: eas.FilterSixMonth,
+		})
 		if err != nil {
 			// 与 syncMailOnce 同理：Coremail 对失效 synckey 回 Status 5，清 key 重拉一次
 			if eas.IsStatusCode(err, 5) && !retried {
@@ -453,7 +461,7 @@ func (e *syncEngine) syncCalendarOnce(ctx context.Context) error {
 				}
 				retried = true
 				// 清掉重置前累积的批次，避免与全量重拉重复追加（幂等无害但冗余）
-				pendingUpserts, pendingDeletes = nil, nil
+				pending = calendarMutations{}
 				noProgressPages = 0
 				page = -1
 				continue
@@ -463,22 +471,28 @@ func (e *syncEngine) syncCalendarOnce(ctx context.Context) error {
 		e.st.mu.Lock()
 		pageProgress := false
 		duplicateIndex := newCalendarEventDuplicateIndex(e.st.Events)
+		duplicateReplay := calendarPageIsDuplicateReplay(res, e.st.Events, e.st.EventAliases, duplicateIndex)
+		if duplicateReplay {
+			pruneCalendarReplayAliasesLocked(
+				e.st.Events,
+				e.st.EventAliases,
+				duplicateIndex,
+				res.Added,
+				&pending,
+			)
+		}
 		for _, ev := range res.Added {
-			if addCalendarEventLocked(e.st.Events, duplicateIndex, ev) {
-				pendingUpserts = append(pendingUpserts, ev)
+			if addCalendarEventLocked(e.st.Events, e.st.EventAliases, duplicateIndex, ev, duplicateReplay, &pending) {
 				pageProgress = true
 			}
 		}
 		for _, ev := range res.Changed {
-			if changeCalendarEventLocked(e.st.Events, duplicateIndex, ev) {
-				pendingUpserts = append(pendingUpserts, ev)
+			if changeCalendarEventLocked(e.st.Events, e.st.EventAliases, duplicateIndex, ev, &pending) {
 				pageProgress = true
 			}
 		}
 		for _, id := range res.Deleted {
-			if _, ok := e.st.Events[id]; ok {
-				delete(e.st.Events, id)
-				pendingDeletes = append(pendingDeletes, id)
+			if deleteCalendarEventLocked(e.st.Events, e.st.EventAliases, duplicateIndex, id, &pending) {
 				pageProgress = true
 			}
 		}
@@ -493,8 +507,8 @@ func (e *syncEngine) syncCalendarOnce(ctx context.Context) error {
 		if shouldSave {
 			// 事件变更按批次追加 events.jsonl（与 synckey 落盘同节奏：
 			// 崩溃丢的是未落盘批次的变更，而 key 也未推进，重拉自然补回）
-			saveErr = e.st.saveCalendarLocked(pendingUpserts, pendingDeletes)
-			pendingUpserts, pendingDeletes = nil, nil
+			saveErr = e.st.saveCalendarLocked(pending)
+			pending = calendarMutations{}
 		}
 		e.st.mu.Unlock()
 		if saveErr != nil {
@@ -515,11 +529,16 @@ func (e *syncEngine) syncCalendarOnce(ctx context.Context) error {
 	return fmt.Errorf("日历同步超过 100 页仍未完成")
 }
 
-// calendarEventsEquivalent reports whether two server records describe the
-// same logical event. ServerID and UID are intentionally ignored: Coremail has
-// been observed allocating fresh values for both while resending an otherwise
-// byte-identical event.
-func calendarEventsEquivalent(a, b eas.EventItem) bool {
+func calendarEventsEqualExceptServerID(a, b eas.EventItem) bool {
+	a.ServerID = ""
+	b.ServerID = ""
+	return reflect.DeepEqual(a, b)
+}
+
+// calendarEventsSameContent intentionally ignores both remote identity fields.
+// It is only safe after the surrounding page has been identified as a replay;
+// using it for arbitrary Add records would hide legitimate identical meetings.
+func calendarEventsSameContent(a, b eas.EventItem) bool {
 	a.ServerID = ""
 	a.UID = ""
 	b.ServerID = ""
@@ -559,13 +578,18 @@ func newCalendarEventDuplicateIndex(events map[string]eas.EventItem) calendarEve
 	return index
 }
 
-func (index calendarEventDuplicateIndex) hasEquivalent(ev eas.EventItem) bool {
-	for _, existing := range index[calendarDuplicateKey(ev)] {
-		if calendarEventsEquivalent(existing, ev) {
-			return true
+func (index calendarEventDuplicateIndex) findEquivalent(ev eas.EventItem, ignoreUID bool) (string, bool) {
+	var match string
+	for id, existing := range index[calendarDuplicateKey(ev)] {
+		equal := calendarEventsEqualExceptServerID(existing, ev)
+		if ignoreUID {
+			equal = calendarEventsSameContent(existing, ev)
+		}
+		if equal && (match == "" || id < match) {
+			match = id
 		}
 	}
-	return false
+	return match, match != ""
 }
 
 func (index calendarEventDuplicateIndex) add(id string, ev eas.EventItem) {
@@ -584,13 +608,11 @@ func (index calendarEventDuplicateIndex) remove(id string, ev eas.EventItem) {
 	}
 }
 
-// dedupeEquivalentCalendarEventsLocked removes exact semantic duplicates even
-// when the server changed both ServerID and UID. The coarse comparable key keeps
-// matching linear for the common case; calendarEventsEquivalent then verifies
-// every remaining field (attendees, recurrence, status, timezone, and so on).
-// Different variants are retained. IDs are sorted first so the surviving CalDAV
-// resource path is deterministic.
-func dedupeEquivalentCalendarEventsLocked(events map[string]eas.EventItem) []string {
+// dedupeEquivalentCalendarEventsLocked repairs only records with the same
+// non-empty iCalendar UID and identical content. Different UIDs are not enough
+// evidence for destructive startup cleanup: two real meetings may otherwise be
+// byte-identical. Suppressed ServerIDs remain as aliases for later Change/Delete.
+func dedupeEquivalentCalendarEventsLocked(events map[string]eas.EventItem, aliases map[string]calendarEventAlias) []string {
 	ids := make([]string, 0, len(events))
 	for id := range events {
 		ids = append(ids, id)
@@ -601,8 +623,13 @@ func dedupeEquivalentCalendarEventsLocked(events map[string]eas.EventItem) []str
 	var duplicates []string
 	for _, id := range ids {
 		ev := events[id]
-		if representatives.hasEquivalent(ev) {
+		if ev.UID == "" {
+			representatives.add(id, ev)
+			continue
+		}
+		if canonicalID, ok := representatives.findEquivalent(ev, false); ok {
 			delete(events, id)
+			aliases[id] = calendarEventAlias{CanonicalID: canonicalID, UID: ev.UID}
 			duplicates = append(duplicates, id)
 			continue
 		}
@@ -617,7 +644,7 @@ func dedupeEquivalentCalendarEventsLocked(events map[string]eas.EventItem) []str
 func repairDuplicateCalendarEventsOnStartup(st *diskState) ([]string, error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	duplicateEventIDs := dedupeEquivalentCalendarEventsLocked(st.Events)
+	duplicateEventIDs := dedupeEquivalentCalendarEventsLocked(st.Events, st.EventAliases)
 	if len(duplicateEventIDs) == 0 {
 		return nil, nil
 	}
@@ -630,38 +657,259 @@ func repairDuplicateCalendarEventsOnStartup(st *diskState) ([]string, error) {
 	return duplicateEventIDs, nil
 }
 
-// addCalendarEventLocked applies EAS Add semantics. Cross-ServerID equivalence
-// suppresses Coremail's duplicate resources only when this ServerID is new.
-func addCalendarEventLocked(events map[string]eas.EventItem, index calendarEventDuplicateIndex, ev eas.EventItem) bool {
+func canonicalCalendarEvent(events map[string]eas.EventItem, aliases map[string]calendarEventAlias, serverID string) (eas.EventItem, string, bool) {
+	if ev, ok := events[serverID]; ok {
+		return ev, serverID, true
+	}
+	alias, ok := aliases[serverID]
+	if !ok {
+		return eas.EventItem{}, "", false
+	}
+	ev, ok := events[alias.CanonicalID]
+	return ev, alias.CanonicalID, ok
+}
+
+// calendarPageIsDuplicateReplay uses page-level evidence before ignoring a
+// rotated UID. Coremail has been observed returning whole MoreAvailable pages
+// whose Add records are byte-identical to cached events except for ServerID/UID.
+func calendarPageIsDuplicateReplay(
+	res *eas.CalendarSyncResult,
+	events map[string]eas.EventItem,
+	aliases map[string]calendarEventAlias,
+	index calendarEventDuplicateIndex,
+) bool {
+	// A single identical Add is still plausibly a real independent meeting.
+	// The observed Coremail failure repeats batches, so require corroboration
+	// from at least two records before ignoring rotated UIDs.
+	if !res.MoreAvailable || len(res.Added) < 2 || len(res.Changed) > 0 || len(res.Deleted) > 0 {
+		return false
+	}
+	for _, ev := range res.Added {
+		if existing, _, ok := canonicalCalendarEvent(events, aliases, ev.ServerID); ok {
+			if !calendarEventsSameContent(existing, ev) {
+				return false
+			}
+			continue
+		}
+		if _, ok := index.findEquivalent(ev, true); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// pruneCalendarReplayAliasesLocked keeps only the replay IDs present on the
+// current duplicate page for each affected canonical event. Coremail can mint
+// fresh IDs forever; retaining every historical replay ID would merely replace
+// full-event cache bloat with unbounded alias bloat.
+func pruneCalendarReplayAliasesLocked(
+	events map[string]eas.EventItem,
+	aliases map[string]calendarEventAlias,
+	index calendarEventDuplicateIndex,
+	added []eas.EventItem,
+	changes *calendarMutations,
+) {
+	keep := map[string]map[string]struct{}{}
+	for _, ev := range added {
+		_, canonicalID, ok := canonicalCalendarEvent(events, aliases, ev.ServerID)
+		if !ok {
+			canonicalID, ok = index.findEquivalent(ev, true)
+		}
+		if !ok {
+			continue
+		}
+		if keep[canonicalID] == nil {
+			keep[canonicalID] = map[string]struct{}{}
+		}
+		keep[canonicalID][ev.ServerID] = struct{}{}
+	}
+	staleStable := map[string][]string{}
+	for aliasID, alias := range aliases {
+		currentIDs, touched := keep[alias.CanonicalID]
+		if !touched {
+			continue
+		}
+		if _, current := currentIDs[aliasID]; current {
+			continue
+		}
+		if !alias.Replay {
+			staleStable[alias.CanonicalID] = append(staleStable[alias.CanonicalID], aliasID)
+			continue
+		}
+		delete(aliases, aliasID)
+		changes.recordAliasDelete(aliasID)
+	}
+	// Aliases from the first PR revision had no replay marker, and Coremail may
+	// reuse the UID while rotating ServerIDs. Retain a small stable-ID reserve
+	// per event, but cap it so legacy state also converges after an upgrade.
+	for _, ids := range staleStable {
+		if len(ids) <= maxCalendarStableAliases {
+			continue
+		}
+		sort.Strings(ids)
+		for _, aliasID := range ids[:len(ids)-maxCalendarStableAliases] {
+			delete(aliases, aliasID)
+			changes.recordAliasDelete(aliasID)
+		}
+	}
+}
+
+// addCalendarEventLocked applies EAS Add semantics. A new ServerID is folded
+// only when it shares a stable UID or belongs to a page-level replay. The alias
+// preserves the remote identity for future incremental Change/Delete commands.
+func addCalendarEventLocked(
+	events map[string]eas.EventItem,
+	aliases map[string]calendarEventAlias,
+	index calendarEventDuplicateIndex,
+	ev eas.EventItem,
+	duplicateReplay bool,
+	changes *calendarMutations,
+) bool {
+	if ev.ServerID == "" {
+		return false
+	}
 	if existing, ok := events[ev.ServerID]; ok {
-		if calendarEventsEquivalent(existing, ev) {
+		if reflect.DeepEqual(existing, ev) {
 			return false
 		}
 		index.remove(ev.ServerID, existing)
 		events[ev.ServerID] = ev
 		index.add(ev.ServerID, ev)
+		changes.recordUpsert(ev)
 		return true
 	}
-	if index.hasEquivalent(ev) {
+	if alias, ok := aliases[ev.ServerID]; ok {
+		if existing, ok := events[alias.CanonicalID]; ok && calendarEventsSameContent(existing, ev) {
+			if alias.UID != ev.UID || (duplicateReplay && !alias.Replay) {
+				alias.UID = ev.UID
+				alias.Replay = alias.Replay || duplicateReplay
+				aliases[ev.ServerID] = alias
+				changes.recordAlias(ev.ServerID, alias)
+			}
+			return false
+		}
+		delete(aliases, ev.ServerID)
+		changes.recordAliasDelete(ev.ServerID)
+	}
+
+	var canonicalID string
+	var equivalent bool
+	replayAlias := duplicateReplay
+	if ev.UID != "" {
+		canonicalID, equivalent = index.findEquivalent(ev, false)
+	}
+	if !equivalent && duplicateReplay {
+		canonicalID, equivalent = index.findEquivalent(ev, true)
+	}
+	if equivalent {
+		alias := calendarEventAlias{CanonicalID: canonicalID, UID: ev.UID, Replay: replayAlias}
+		aliases[ev.ServerID] = alias
+		changes.recordAlias(ev.ServerID, alias)
 		return false
 	}
 	events[ev.ServerID] = ev
 	index.add(ev.ServerID, ev)
+	changes.recordUpsert(ev)
 	return true
 }
 
-// changeCalendarEventLocked always applies a real Changed record to its own
-// ServerID. It must not be rejected merely because its new contents match a
-// different event; the server has already advanced the SyncKey for this change.
-func changeCalendarEventLocked(events map[string]eas.EventItem, index calendarEventDuplicateIndex, ev eas.EventItem) bool {
+// changeCalendarEventLocked updates a canonical record directly. A changed alias
+// that diverges is split back into an independent event instead of overwriting or
+// deleting the canonical meeting.
+func changeCalendarEventLocked(
+	events map[string]eas.EventItem,
+	aliases map[string]calendarEventAlias,
+	index calendarEventDuplicateIndex,
+	ev eas.EventItem,
+	changes *calendarMutations,
+) bool {
+	if ev.ServerID == "" {
+		return false
+	}
 	if existing, ok := events[ev.ServerID]; ok {
-		if calendarEventsEquivalent(existing, ev) {
+		if reflect.DeepEqual(existing, ev) {
 			return false
 		}
 		index.remove(ev.ServerID, existing)
+		events[ev.ServerID] = ev
+		index.add(ev.ServerID, ev)
+		changes.recordUpsert(ev)
+		return true
+	}
+	if alias, ok := aliases[ev.ServerID]; ok {
+		if existing, ok := events[alias.CanonicalID]; ok && calendarEventsSameContent(existing, ev) {
+			if alias.UID != ev.UID {
+				alias.UID = ev.UID
+				aliases[ev.ServerID] = alias
+				changes.recordAlias(ev.ServerID, alias)
+			}
+			return false
+		}
+		delete(aliases, ev.ServerID)
+		changes.recordAliasDelete(ev.ServerID)
 	}
 	events[ev.ServerID] = ev
 	index.add(ev.ServerID, ev)
+	changes.recordUpsert(ev)
+	return true
+}
+
+// deleteCalendarEventLocked removes one remote identity. Deleting an alias does
+// not delete the visible event; deleting the canonical ID promotes a remaining
+// alias so the logical meeting survives until the server deletes its last ID.
+func deleteCalendarEventLocked(
+	events map[string]eas.EventItem,
+	aliases map[string]calendarEventAlias,
+	index calendarEventDuplicateIndex,
+	serverID string,
+	changes *calendarMutations,
+) bool {
+	if _, ok := aliases[serverID]; ok {
+		delete(aliases, serverID)
+		changes.recordAliasDelete(serverID)
+		return false
+	}
+	existing, ok := events[serverID]
+	if !ok {
+		return false
+	}
+
+	var members []string
+	for aliasID, alias := range aliases {
+		if alias.CanonicalID == serverID {
+			members = append(members, aliasID)
+		}
+	}
+	if len(members) == 0 {
+		index.remove(serverID, existing)
+		delete(events, serverID)
+		changes.recordDelete(serverID)
+		return true
+	}
+
+	sort.Strings(members)
+	promotedID := members[0]
+	promotedAlias := aliases[promotedID]
+	delete(aliases, promotedID)
+	changes.recordAliasDelete(promotedID)
+
+	index.remove(serverID, existing)
+	delete(events, serverID)
+	changes.recordDelete(serverID)
+
+	promoted := existing
+	promoted.ServerID = promotedID
+	promoted.UID = promotedAlias.UID
+	events[promotedID] = promoted
+	index.add(promotedID, promoted)
+	changes.recordUpsert(promoted)
+
+	for _, aliasID := range members[1:] {
+		alias := aliases[aliasID]
+		alias.CanonicalID = promotedID
+		aliases[aliasID] = alias
+		changes.recordAlias(aliasID, alias)
+	}
 	return true
 }
 

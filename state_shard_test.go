@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -175,6 +176,107 @@ func TestEventShardPersistence(t *testing.T) {
 	st3, _ := loadState(filepath.Join(dir, "state.json"))
 	if _, ok := st3.Events["e1"]; ok {
 		t.Fatal("事件删除未落盘")
+	}
+}
+
+func TestCalendarAliasPersistsThroughLogAndSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	st, err := loadState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical := eas.EventItem{ServerID: "ev1", UID: "uid1", Subject: "会议"}
+	if err := st.upsertEvent(canonical); err != nil {
+		t.Fatal(err)
+	}
+
+	st.mu.Lock()
+	alias := calendarEventAlias{CanonicalID: canonical.ServerID, UID: canonical.UID}
+	st.EventAliases["ev2"] = alias
+	var changes calendarMutations
+	changes.recordAlias("ev2", alias)
+	err = st.saveCalendarLocked(changes)
+	st.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fromLog, err := loadState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fromLog.EventAliases["ev2"]; got != alias {
+		t.Fatalf("replayed alias = %+v, want %+v", got, alias)
+	}
+
+	fromLog.mu.Lock()
+	err = fromLog.writeEventsSnapshotLocked()
+	fromLog.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromSnapshot, err := loadState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fromSnapshot.EventAliases["ev2"]; got != alias {
+		t.Fatalf("snapshotted alias = %+v, want %+v", got, alias)
+	}
+}
+
+func TestCalendarAliasPromotionPersistsAsAtomicBatch(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	st, err := loadState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical := eas.EventItem{ServerID: "ev-a", UID: "uid-a", Subject: "会议"}
+	st.Events[canonical.ServerID] = canonical
+	st.EventAliases["ev-b"] = calendarEventAlias{CanonicalID: canonical.ServerID, UID: "uid-b"}
+	st.EventAliases["ev-c"] = calendarEventAlias{CanonicalID: canonical.ServerID, UID: "uid-c"}
+	st.mu.Lock()
+	if err := st.writeEventsSnapshotLocked(); err != nil {
+		st.mu.Unlock()
+		t.Fatal(err)
+	}
+	st.mu.Unlock()
+
+	st.mu.Lock()
+	index := newCalendarEventDuplicateIndex(st.Events)
+	var changes calendarMutations
+	if !deleteCalendarEventLocked(st.Events, st.EventAliases, index, canonical.ServerID, &changes) {
+		st.mu.Unlock()
+		t.Fatal("canonical deletion did not promote an alias")
+	}
+	err = st.saveCalendarLocked(changes)
+	st.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(st.eventLogPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := bytes.FieldsFunc(data, func(r rune) bool { return r == '\n' })
+	if len(lines) != 1 {
+		t.Fatalf("promotion log lines = %d, want one atomic batch", len(lines))
+	}
+
+	reloaded, err := loadState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := reloaded.Events["ev-a"]; ok {
+		t.Fatal("deleted canonical ID reappeared")
+	}
+	if got := reloaded.Events["ev-b"].UID; got != "uid-b" {
+		t.Fatalf("promoted UID = %q, want uid-b", got)
+	}
+	if got := reloaded.EventAliases["ev-c"].CanonicalID; got != "ev-b" {
+		t.Fatalf("retargeted alias = %q, want ev-b", got)
 	}
 }
 

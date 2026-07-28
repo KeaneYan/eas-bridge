@@ -60,8 +60,8 @@ func (b *caldavBackend) CreateCalendar(ctx context.Context, calendar *caldav.Cal
 }
 
 func (b *caldavBackend) ListCalendars(ctx context.Context) ([]caldav.Calendar, error) {
-	if err := b.maybeSyncCalendar(ctx); err != nil {
-		log.Printf("[caldav] 同步失败（用缓存数据）: %v", err)
+	if err := b.prepareCalendarRead(ctx); err != nil {
+		return nil, err
 	}
 	return []caldav.Calendar{{
 		Path:                  caldavCalendarPath,
@@ -84,8 +84,8 @@ func (b *caldavBackend) GetCalendar(ctx context.Context, path string) (*caldav.C
 }
 
 func (b *caldavBackend) GetCalendarObject(ctx context.Context, path string, req *caldav.CalendarCompRequest) (*caldav.CalendarObject, error) {
-	if err := b.maybeSyncCalendar(ctx); err != nil {
-		log.Printf("[caldav] 同步失败（用缓存数据）: %v", err)
+	if err := b.prepareCalendarRead(ctx); err != nil {
+		return nil, err
 	}
 	serverID, err := objectPathToServerID(path)
 	if err != nil {
@@ -104,8 +104,8 @@ func (b *caldavBackend) ListCalendarObjects(ctx context.Context, path string, re
 	if path != caldavCalendarPath {
 		return nil, webdav.NewHTTPError(http.StatusNotFound, fmt.Errorf("日历不存在: %s", path))
 	}
-	if err := b.maybeSyncCalendar(ctx); err != nil {
-		log.Printf("[caldav] 同步失败（用缓存数据）: %v", err)
+	if err := b.prepareCalendarRead(ctx); err != nil {
+		return nil, err
 	}
 	return b.allObjects(), nil
 }
@@ -114,8 +114,8 @@ func (b *caldavBackend) QueryCalendarObjects(ctx context.Context, path string, q
 	if path != caldavCalendarPath {
 		return nil, webdav.NewHTTPError(http.StatusNotFound, fmt.Errorf("日历不存在: %s", path))
 	}
-	if err := b.maybeSyncCalendar(ctx); err != nil {
-		log.Printf("[caldav] 同步失败（用缓存数据）: %v", err)
+	if err := b.prepareCalendarRead(ctx); err != nil {
+		return nil, err
 	}
 	// caldav.Filter 自带 time-range 匹配（含 RRULE 展开判断）
 	return caldav.Filter(query, b.allObjects())
@@ -124,6 +124,41 @@ func (b *caldavBackend) QueryCalendarObjects(ctx context.Context, path string, q
 // PutCalendarObject / DeleteCalendarObject 的写路径实现在 caldav_write.go。
 
 // ---------- 内部 ----------
+
+func (b *caldavBackend) hasUsableCalendarCache() bool {
+	b.engine.st.mu.Lock()
+	defer b.engine.st.mu.Unlock()
+	if len(b.engine.st.Events) > 0 {
+		return true
+	}
+	for _, folder := range b.engine.st.Folders {
+		if folder.Type != eas.FolderTypeCalendar {
+			continue
+		}
+		key := b.engine.st.SyncKeys[folder.ServerID]
+		return key != "" && key != "0"
+	}
+	return false
+}
+
+// prepareCalendarRead serves stale data only after at least one successful
+// calendar sync. Returning an authoritative empty list or 404 before that point
+// can make CalDAV clients interpret a temporary EAS outage as mass deletion.
+func (b *caldavBackend) prepareCalendarRead(ctx context.Context) error {
+	err := b.maybeSyncCalendar(ctx)
+	if err == nil && b.hasUsableCalendarCache() {
+		return nil
+	}
+	if err == nil {
+		err = errors.New("日历尚未完成首次同步")
+	}
+	if b.hasUsableCalendarCache() {
+		log.Printf("[caldav] 同步失败（用缓存数据）: %v", err)
+		return nil
+	}
+	log.Printf("[caldav] 同步失败且无可用缓存: %v", err)
+	return webdav.NewHTTPError(http.StatusServiceUnavailable, fmt.Errorf("日历暂时不可用: %w", err))
+}
 
 // maybeSyncCalendar uses stale-while-revalidate: when cached events exist, an
 // expired cache is refreshed in the background so CalDAV reads stay responsive.
@@ -135,11 +170,7 @@ func (b *caldavBackend) maybeSyncCalendar(ctx context.Context) error {
 	}
 	b.calMu.Unlock()
 
-	b.engine.st.mu.Lock()
-	hasCachedEvents := len(b.engine.st.Events) > 0
-	b.engine.st.mu.Unlock()
-
-	if hasCachedEvents {
+	if b.hasUsableCalendarCache() {
 		go func() {
 			syncCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 			defer cancel()
