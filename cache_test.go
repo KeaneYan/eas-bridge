@@ -68,30 +68,74 @@ func TestAtomicWriteFile(t *testing.T) {
 func TestFlightGroupDeduplicatesConcurrentCalls(t *testing.T) {
 	var group flightGroup
 	var calls atomic.Int32
-	start := make(chan struct{})
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseAll()
+
 	var wg sync.WaitGroup
-	for range 8 {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, err := group.Do("same-key", func() (any, error) {
+			calls.Add(1)
+			close(started)
+			<-release
+			return "ok", nil
+		})
+		if err != nil {
+			t.Errorf("leader Do: %v", err)
+		}
+	}()
+	<-started
+
+	observed := make([]chan struct{}, 7)
+	for i := range observed {
+		observed[i] = make(chan struct{})
+		ctx := &doneObservedContext{
+			Context:  context.Background(),
+			observed: observed[i],
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := group.Do("same-key", func() (any, error) {
+			_, err := group.DoContext(ctx, "same-key", func() (any, error) {
 				calls.Add(1)
-				<-start
 				return "ok", nil
 			})
 			if err != nil {
-				t.Errorf("Do: %v", err)
+				t.Errorf("waiter Do: %v", err)
 			}
 		}()
 	}
-	for calls.Load() == 0 {
-		time.Sleep(time.Millisecond)
+	for i, ch := range observed {
+		select {
+		case <-ch:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("waiter %d did not join the active flight", i)
+		}
 	}
-	close(start)
+	releaseAll()
 	wg.Wait()
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("calls = %d, want 1", got)
 	}
+}
+
+// doneObservedContext reports when DoContext reaches the waiter select. The
+// callback cannot close this signal because the flight leader path never reads
+// ctx.Done(), so the test can release the leader without scheduler-dependent
+// sleeps.
+type doneObservedContext struct {
+	context.Context
+	observed chan struct{}
+	once     sync.Once
+}
+
+func (ctx *doneObservedContext) Done() <-chan struct{} {
+	ctx.once.Do(func() { close(ctx.observed) })
+	return ctx.Context.Done()
 }
 
 func TestPruneMIMECacheRemovesLegacyVersions(t *testing.T) {
