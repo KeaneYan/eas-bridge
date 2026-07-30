@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"time"
 
 	"github.com/emersion/go-sasl"
 	"github.com/emersion/go-smtp"
@@ -13,18 +14,20 @@ import (
 
 // smtpBackend 实现 go-smtp Backend：AUTH PLAIN 鉴权 + MIME 透传到 EAS SendMail。
 type smtpBackend struct {
-	engine *syncEngine
+	engine       *syncEngine
+	lifecycleCtx context.Context
 }
 
 func (b *smtpBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
-	return &smtpSession{engine: b.engine}, nil
+	return &smtpSession{engine: b.engine, lifecycleCtx: b.lifecycleCtx}, nil
 }
 
 type smtpSession struct {
-	engine *syncEngine
-	authed bool
-	from   string
-	rcpts  []string
+	engine       *syncEngine
+	lifecycleCtx context.Context
+	authed       bool
+	from         string
+	rcpts        []string
 }
 
 func (s *smtpSession) AuthMechanisms() []string {
@@ -88,7 +91,13 @@ func (s *smtpSession) Data(r io.Reader) error {
 		return fmt.Errorf("空报文")
 	}
 	log.Printf("[smtpd] 发送: from=%s rcpts=%d size=%d", s.from, len(s.rcpts), len(mime))
-	err = s.engine.c.SendMail(context.Background(), eas.SendMailOptions{MIME: mime})
+	parent := s.lifecycleCtx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, easRequestTimeout)
+	defer cancel()
+	err = s.engine.c.SendMail(ctx, eas.SendMailOptions{MIME: mime})
 	if err != nil {
 		log.Printf("[smtpd] EAS SendMail 失败: %v", err)
 		return fmt.Errorf("发送失败: %v", err)
@@ -99,13 +108,15 @@ func (s *smtpSession) Data(r io.Reader) error {
 }
 
 // ServeSMTP 启动 SMTP 监听（阻塞）。
-func newSMTPServer(engine *syncEngine, addr string) *smtp.Server {
-	be := &smtpBackend{engine: engine}
+func newSMTPServer(engine *syncEngine, addr string, lifecycleCtx context.Context) *smtp.Server {
+	be := &smtpBackend{engine: engine, lifecycleCtx: lifecycleCtx}
 	s := smtp.NewServer(be)
 	s.Addr = addr
 	s.Domain = "localhost"
 	s.AllowInsecureAuth = true // 仅 localhost 监听
 	s.MaxMessageBytes = 50 << 20
 	s.MaxRecipients = 100
+	s.ReadTimeout = 5 * time.Minute
+	s.WriteTimeout = 5 * time.Minute
 	return s
 }

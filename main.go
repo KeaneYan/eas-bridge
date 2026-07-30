@@ -51,6 +51,7 @@ func main() {
 
 	// 启动 IMAP 服务
 	imapD := newIMAPD(engine)
+	go imapD.monitorConnections(ctx, 10*time.Minute)
 	go func() {
 		// Serve 正常被 Shutdown 时返回 nil；若信号抢在监听建立前到达会
 		// 返回 go-imap 未导出的 errClosed——用 ShuttingDown 兜底区分
@@ -60,7 +61,7 @@ func main() {
 	}()
 
 	// 启动 SMTP 服务
-	smtpSrv := newSMTPServer(engine, cfg.SMTPAddr)
+	smtpSrv := newSMTPServer(engine, cfg.SMTPAddr, ctx)
 	go func() {
 		log.Printf("[smtpd] 监听 %s", cfg.SMTPAddr)
 		if err := smtpSrv.ListenAndServe(); err != nil && !errors.Is(err, smtp.ErrServerClosed) {

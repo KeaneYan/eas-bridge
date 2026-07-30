@@ -70,12 +70,27 @@ IMAP COPY 用 MoveItems 实现（移动语义，与 DavMail 一致）；APPEND �
 ### FetchAttachment 的 Data 是未解码 base64 原文，调用方必须解码（2026-07-25 图片全挂事故）
 fork 保持上游语义不解码（FORK-NOTES）。eas-bridge 曾直接用 `got.Data` 构建 MIME → `writeBase64` 二次编码 → 双层 base64，Apple Mail 解一层后拿到 `iVBORw0K...` 文本，**所有图片/附件全坏**。修复：解码收拢进 `downloadAttachment`（尺寸引导 `decodeAttachmentData`，与 webank-mail 逐字节一致）。
 **分块路径两个叠加坑**（ZCode B-1/H-1）：① 每块的 Data 是**独立** base64 编码各自带 padding（4MB 不被 3 整除，中间块必有 `==`），拼接后整体解码必然在中间 padding 处失败；② Range 作用于**原始字节**（MS-ASCMD：附件 range applies to the file content），偏移必须按**解码后**长度推进，按 base64 文本长度推进会跳 ~1/3 内容。正确姿势：逐块 `decodeBase64Chunk` → 拼接原始字节。
+超过 4 MiB 的附件直接走 Range 分块，避免弱网或代理链路下单个大响应反复撞 EAS HTTP 2 分钟超时。
 **改 MIME 构建后必须 bump `mimeCacheVersion`**——已污染的 .eml/.bin 缓存不会自愈。
 
 ### Status 5 风暴必须退避，不能每分钟全量重拉（2026-07-25 凌晨 6 小时事故）
 Coremail 对失效 synckey 回 Status 5；但**服务器整体故障时全文件夹都回 5**。此时"清 key + 全量重拉"每轮询周期一次 = 每分钟对每个文件夹全拉 6 个月邮件，打服务器+毁本地状态。`syncEngine.backoff`（纯内存）：成功清零、Status 5 按 1m→5m→15m→30m 升档、退避期 `skipBackoff` 短路返回 nil（本地 state 照常服务 IMAP/CalDAV 读）。
 **两条并发纪律**：`trackSyncResult` 必须放 singleflight fn **内**（flight 合并后每个调用者都会拿到同一 err，放外面会重复升档，ZCode H-1）；poller 退避期**不得 onChange 广播**（无新数据却刷醒客户端）。
 **后续（2026-07-25 P3）**：日历退避跳过改返回 `ErrSyncBackoffSkip` sentinel（maybeSyncCalendar 内部消化，lastCalSync 只在真成功推进）；syncMail 仍返回 nil（IMAP 会把错误透传客户端）。优雅退出：main 信号后 cancel→CalDAV/SMTP 渐进 Shutdown(10s)→IMAP Close；`imapd.shuttingDown` 标志区分"信号抢先于监听"时 go-imap 未导出 errClosed 与真故障，防 log.Fatal 误判。
+
+### 临时网络故障必须全局熔断并限制并发
+一次 DNS 故障会让 Apple Mail 的 SELECT/STATUS、后台邮件轮询和日历轮询同时醒来；逐文件夹
+独立重试会在同一秒把故障放大。所有邮件/日历 Sync 共享 4 个并发槽，并对 DNS、超时、
+EOF、HTTP 429/5xx 使用 5s→30s→2m→5m 的全局短退避。同步成功即清零。轮询使用按
+folderID 稳定生成的微小 jitter，避免所有文件夹整点齐发。
+
+IMAP 读路径可在临时故障或全局退避时返回已完成过同步的本地缓存；但“从未同步、空缓存”
+必须继续报错，否则客户端会把远端真实邮箱误判为一个成功同步的空邮箱。EAS HTTP 客户端和
+SMTP SendMail 均有 2 分钟上游超时，SMTP 连接读写期限为 5 分钟。
+
+IMAP 每 10 分钟记录 `imap_active`、`imap_total`、`imap_high_water` 和 goroutine 数。文件
+描述符里出现 `CLOSED` socket 不等于已经确认连接泄漏；先用这些会话计数和可复现的连接压测
+判断，再决定是否修改上游 go-imap 生命周期。
 
 ### 后台任务必须绑定 daemon 生命周期
 CalDAV stale-while-revalidate、邮件/日历 poller 和 MIME 缓存修剪都必须派生自 main
@@ -88,8 +103,14 @@ SIGTERM 后继续访问 EAS/state。缓存修剪同样要在 ctx 取消后停止
 ### FetchAttachment 明确无数据时要退避
 Coremail 偶尔会为已声明的 FileReference 返回成功响应但不含 Data。Apple Mail 会重复
 请求同一个 MIME part；如果每次都直打 EAS，会形成每分钟一次的无效下载。只对
-`FetchAttachment: no data in response` 做纯内存 1m→5m→15m→1h 退避；普通网络错误
-仍立即重试，成功后清除退避，且任何失败都不得写入附件缓存。
+`FetchAttachment: no data in response` 做纯内存 1m→5m→15m→1h→6h→24h 退避；每次
+退避到期后的远端重试都可重新 Fetch 邮件元数据，若 FileReference 已轮换则立即用新引用
+重试并同步更新内存摘要。普通网络错误仍立即重试，成功后清除退避，且任何失败都不得写入
+附件缓存。
+
+附件数据缺失不能让 BODYSTRUCTURE / RFC822.SIZE 失败。未知尺寸附件估算时把缺失内容按空
+数据处理，只影响实际打开/保存该附件；Apple Mail 重复请求同一退避中的 part 时，go-imap
+错误日志最多每小时记录一次。
 
 ## 三、架构不变量
 

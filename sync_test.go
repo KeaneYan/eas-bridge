@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -105,6 +108,144 @@ func TestSyncBackoffEscalatesAndClears(t *testing.T) {
 	e.trackSyncResult("mail:inbox", errors.New("connection reset"))
 	if d := e.backoffRemaining("mail:inbox"); d != 0 {
 		t.Fatalf("非 Status 5 错误不应退避，实际 %v", d)
+	}
+}
+
+func TestTransientEASErrorClassification(t *testing.T) {
+	for _, err := range []error{
+		&net.DNSError{Err: "no such host", Name: "mail.example.com"},
+		context.DeadlineExceeded,
+		&eas.HTTPError{StatusCode: http.StatusBadGateway},
+		&eas.HTTPError{StatusCode: http.StatusTooManyRequests},
+	} {
+		if !isTransientEASError(err) {
+			t.Fatalf("%T should be transient: %v", err, err)
+		}
+	}
+	for _, err := range []error{
+		context.Canceled,
+		&eas.HTTPError{StatusCode: http.StatusUnauthorized},
+		&eas.StatusError{Command: "Sync", Code: 5},
+		errors.New("invalid response"),
+	} {
+		if isTransientEASError(err) {
+			t.Fatalf("%T should not be transient: %v", err, err)
+		}
+	}
+}
+
+func TestTransientEASBackoffSkipsAndClears(t *testing.T) {
+	engine := &syncEngine{}
+	cause := &net.DNSError{Err: "no such host", Name: "mail.example.com"}
+	engine.trackTransientEASResult(cause)
+	var backoffErr *transientBackoffError
+	if err := engine.transientBackoffError(); !errors.As(err, &backoffErr) {
+		t.Fatalf("backoff error = %v, want transientBackoffError", err)
+	}
+	engine.trackTransientEASResult(nil)
+	if err := engine.transientBackoffError(); err != nil {
+		t.Fatalf("success did not clear transient backoff: %v", err)
+	}
+}
+
+func TestEASSyncConcurrencyIsBounded(t *testing.T) {
+	st := mustLoadTestState(t)
+	var active atomic.Int64
+	var maximum atomic.Int64
+	engine := &syncEngine{
+		st: st,
+		c: &easmock.Client{
+			EmailClient: easmock.EmailClient{
+				SyncEmailFunc: func(context.Context, string, eas.EmailSyncOptions) (*eas.EmailSyncResult, error) {
+					current := active.Add(1)
+					for {
+						seen := maximum.Load()
+						if current <= seen || maximum.CompareAndSwap(seen, current) {
+							break
+						}
+					}
+					time.Sleep(30 * time.Millisecond)
+					active.Add(-1)
+					return &eas.EmailSyncResult{}, nil
+				},
+			},
+		},
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 12)
+	for i := 0; i < 12; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs <- engine.syncMail(context.Background(), fmt.Sprintf("folder-%d", i))
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := maximum.Load(); got > maxConcurrentEASSyncs {
+		t.Fatalf("maximum concurrent EAS syncs = %d, limit %d", got, maxConcurrentEASSyncs)
+	}
+	if got := maximum.Load(); got < 2 {
+		t.Fatalf("syncs were unexpectedly serialized, maximum = %d", got)
+	}
+}
+
+func TestSyncMailForReadServesUsableCacheOnTransientFailure(t *testing.T) {
+	newFailingEngine := func(st *diskState) *syncEngine {
+		return &syncEngine{
+			st: st,
+			c: &easmock.Client{
+				EmailClient: easmock.EmailClient{
+					SyncEmailFunc: func(context.Context, string, eas.EmailSyncOptions) (*eas.EmailSyncResult, error) {
+						return nil, &net.DNSError{Err: "no such host", Name: "mail.example.com"}
+					},
+				},
+			},
+		}
+	}
+
+	cached := mustLoadTestState(t)
+	cached.SyncKeys["inbox"] = "synced"
+	if err := newFailingEngine(cached).syncMailForRead(context.Background(), "inbox"); err != nil {
+		t.Fatalf("usable cached folder should survive outage: %v", err)
+	}
+
+	empty := mustLoadTestState(t)
+	if err := newFailingEngine(empty).syncMailForRead(context.Background(), "inbox"); err == nil {
+		t.Fatal("never-synced empty folder should return the upstream error")
+	}
+
+	unauthorized := mustLoadTestState(t)
+	unauthorized.SyncKeys["inbox"] = "synced"
+	unauthorizedEngine := &syncEngine{
+		st: unauthorized,
+		c: &easmock.Client{
+			EmailClient: easmock.EmailClient{
+				SyncEmailFunc: func(context.Context, string, eas.EmailSyncOptions) (*eas.EmailSyncResult, error) {
+					return nil, &eas.HTTPError{StatusCode: http.StatusUnauthorized}
+				},
+			},
+		},
+	}
+	if err := unauthorizedEngine.syncMailForRead(context.Background(), "inbox"); err == nil {
+		t.Fatal("authentication errors must not be hidden by stale cache")
+	}
+}
+
+func TestStablePollJitterIsBoundedAndDeterministic(t *testing.T) {
+	interval := time.Minute
+	first := stablePollJitter("inbox", interval)
+	second := stablePollJitter("inbox", interval)
+	if first != second {
+		t.Fatalf("jitter is not deterministic: %v != %v", first, second)
+	}
+	if first < 0 || first >= interval/10 {
+		t.Fatalf("jitter %v outside [0, %v)", first, interval/10)
 	}
 }
 
@@ -738,6 +879,84 @@ func TestCalendarReplayBackoffClearsAfterNormalCompletion(t *testing.T) {
 	engine.trackCalendarReplayResult(false)
 	if d := engine.calendarReplayBackoffRemaining(); d != 0 {
 		t.Fatalf("normal completion did not clear replay backoff: %v", d)
+	}
+}
+
+func TestCalendarProgressBeforeStallClearsReplayBackoff(t *testing.T) {
+	st := mustLoadTestState(t)
+	start := time.Date(2026, time.July, 28, 14, 0, 0, 0, time.UTC)
+	existing := []eas.EventItem{
+		{
+			ServerID:  "Event:original:1",
+			UID:       "stable-uid-1",
+			Subject:   "Standup",
+			StartTime: start,
+			EndTime:   start.Add(30 * time.Minute),
+		},
+		{
+			ServerID:  "Event:original:2",
+			UID:       "stable-uid-2",
+			Subject:   "Planning",
+			StartTime: start.Add(time.Hour),
+			EndTime:   start.Add(2 * time.Hour),
+		},
+	}
+	realEvent := eas.EventItem{
+		ServerID:  "Event:real",
+		UID:       "real-uid",
+		Subject:   "New meeting",
+		StartTime: start.Add(3 * time.Hour),
+		EndTime:   start.Add(4 * time.Hour),
+	}
+	st.Folders = []eas.Folder{{ServerID: "calendar", Type: eas.FolderTypeCalendar}}
+	for _, event := range existing {
+		if err := st.upsertEvent(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	calls := 0
+	engine := &syncEngine{
+		st: st,
+		c: &easmock.Client{
+			CalendarClient: easmock.CalendarClient{
+				SyncCalendarFunc: func(context.Context, string, eas.CalendarSyncOptions) (*eas.CalendarSyncResult, error) {
+					calls++
+					if calls == 1 {
+						return &eas.CalendarSyncResult{
+							MoreAvailable: true,
+							Added:         []eas.EventItem{realEvent},
+						}, nil
+					}
+					replayed := make([]eas.EventItem, len(existing))
+					for i, event := range existing {
+						event.ServerID = fmt.Sprintf("Event:replay:%d:%d", calls, i)
+						event.UID = fmt.Sprintf("rotated-uid:%d:%d", calls, i)
+						replayed[i] = event
+					}
+					return &eas.CalendarSyncResult{
+						MoreAvailable: true,
+						Added:         replayed,
+					}, nil
+				},
+			},
+		},
+	}
+	engine.trackCalendarReplayResult(true)
+	if err := engine.syncCalendarOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls != maxCalendarNoProgressPages+1 {
+		t.Fatalf("SyncCalendar calls = %d, want %d", calls, maxCalendarNoProgressPages+1)
+	}
+	if _, ok := st.Events[realEvent.ServerID]; !ok {
+		t.Fatal("real event from the first page was not retained")
+	}
+	engine.calendarReplayMu.Lock()
+	backoff := engine.calendarReplayBackoff
+	engine.calendarReplayMu.Unlock()
+	if backoff.failures != 0 || engine.calendarReplayBackoffRemaining() != 0 {
+		t.Fatalf("progress-before-stall left replay backoff behind: %+v", backoff)
 	}
 }
 

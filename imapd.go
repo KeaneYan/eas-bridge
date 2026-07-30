@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -25,10 +27,82 @@ type imapd struct {
 	srvMu        sync.Mutex
 	srv          *imapserver.Server // Serve 启动后赋值，供 Shutdown 关闭
 	shuttingDown bool               // Shutdown 已发起：Serve 因此返回的错误不算故障
+
+	activeSessions atomic.Int64
+	totalSessions  atomic.Uint64
+	highWater      atomic.Int64
 }
 
 func newIMAPD(engine *syncEngine) *imapd {
 	return &imapd{engine: engine, subs: map[chan string]struct{}{}}
+}
+
+type imapConnectionStats struct {
+	Active    int64
+	Total     uint64
+	HighWater int64
+}
+
+func (d *imapd) sessionOpened() {
+	active := d.activeSessions.Add(1)
+	d.totalSessions.Add(1)
+	for {
+		highWater := d.highWater.Load()
+		if active <= highWater || d.highWater.CompareAndSwap(highWater, active) {
+			return
+		}
+	}
+}
+
+func (d *imapd) sessionClosed() {
+	d.activeSessions.Add(-1)
+}
+
+func (d *imapd) connectionStats() imapConnectionStats {
+	return imapConnectionStats{
+		Active:    d.activeSessions.Load(),
+		Total:     d.totalSessions.Load(),
+		HighWater: d.highWater.Load(),
+	}
+}
+
+func (d *imapd) monitorConnections(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			stats := d.connectionStats()
+			log.Printf(
+				"[health] imap_active=%d imap_total=%d imap_high_water=%d goroutines=%d",
+				stats.Active,
+				stats.Total,
+				stats.HighWater,
+				runtime.NumGoroutine(),
+			)
+		}
+	}
+}
+
+type imapServerLogger struct {
+	mu                    sync.Mutex
+	lastAttachmentBackoff time.Time
+}
+
+func (l *imapServerLogger) Printf(format string, args ...interface{}) {
+	message := fmt.Sprintf(format, args...)
+	if strings.Contains(message, "附件暂不可用") {
+		l.mu.Lock()
+		if time.Since(l.lastAttachmentBackoff) < time.Hour {
+			l.mu.Unlock()
+			return
+		}
+		l.lastAttachmentBackoff = time.Now()
+		l.mu.Unlock()
+	}
+	log.Print(message)
 }
 
 // subscribe 注册一个 IDLE 通知通道，返回退订函数。
@@ -61,9 +135,12 @@ func (d *imapd) Serve(addr string) error {
 	srv := imapserver.New(&imapserver.Options{
 		NewSession: func(conn *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
 			ctx, cancel := context.WithCancel(context.Background())
-			return &imapSession{d: d, conn: conn, ctx: ctx, cancel: cancel}, &imapserver.GreetingData{}, nil
+			session := &imapSession{d: d, conn: conn, ctx: ctx, cancel: cancel, counted: true}
+			d.sessionOpened()
+			return session, &imapserver.GreetingData{}, nil
 		},
 		InsecureAuth: true, // 仅 localhost 监听，无需 TLS
+		Logger:       &imapServerLogger{},
 	})
 	d.srvMu.Lock()
 	d.srv = srv
@@ -101,10 +178,13 @@ func (d *imapd) ShuttingDown() bool {
 // ---------- IMAP Session ----------
 
 type imapSession struct {
-	d      *imapd
-	conn   *imapserver.Conn
-	ctx    context.Context
-	cancel context.CancelFunc
+	d       *imapd
+	conn    *imapserver.Conn
+	ctx     context.Context
+	cancel  context.CancelFunc
+	counted bool
+
+	closeOnce sync.Once
 
 	selected string        // folderID
 	snap     *mboxSnapshot // 选中时的快照
@@ -119,9 +199,14 @@ type mboxSnapshot struct {
 }
 
 func (sess *imapSession) Close() error {
-	if sess.cancel != nil {
-		sess.cancel()
-	}
+	sess.closeOnce.Do(func() {
+		if sess.cancel != nil {
+			sess.cancel()
+		}
+		if sess.counted {
+			sess.d.sessionClosed()
+		}
+	})
 	return nil
 }
 
@@ -203,7 +288,7 @@ func (sess *imapSession) Status(mailbox string, options *imap.StatusOptions) (*i
 	}
 	ctx, cancel := context.WithTimeout(sess.ctx, 90*time.Second)
 	defer cancel()
-	if err := sess.d.engine.syncMail(ctx, folder.ServerID); err != nil {
+	if err := sess.d.engine.syncMailForRead(ctx, folder.ServerID); err != nil {
 		return nil, fmt.Errorf("同步失败: %w", err)
 	}
 	st := sess.d.engine.st
@@ -233,7 +318,7 @@ func (sess *imapSession) Select(mailbox string, options *imap.SelectOptions) (*i
 	}
 	ctx, cancel := context.WithTimeout(sess.ctx, 90*time.Second)
 	defer cancel()
-	if err := sess.d.engine.syncMail(ctx, folder.ServerID); err != nil {
+	if err := sess.d.engine.syncMailForRead(ctx, folder.ServerID); err != nil {
 		return nil, fmt.Errorf("同步失败: %w", err)
 	}
 	st := sess.d.engine.st
