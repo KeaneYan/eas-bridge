@@ -99,7 +99,7 @@ func TestMessagePlanFetchesOnlyRequestedAttachmentPart(t *testing.T) {
 }
 
 func TestDownloadAttachmentUsesRangesForLargeFiles(t *testing.T) {
-	size := 2*attachmentChunkSize + 1
+	size := attachmentChunkSize + 1
 	// 服务器对每个分块独立 base64 编码：Range 作用于原始字节，Data 是该
 	// 字节区间的 base64 文本（中间分块也各自带 padding——4MB 不被 3 整除）。
 	content := make([]byte, size)
@@ -129,8 +129,8 @@ func TestDownloadAttachmentUsesRangesForLargeFiles(t *testing.T) {
 	if !bytes.Equal(got, content) {
 		t.Fatalf("downloaded content mismatch: got %d bytes, want %d", len(got), size)
 	}
-	if len(ranges) != 3 {
-		t.Fatalf("range requests = %v, want 3 chunks", ranges)
+	if len(ranges) != 2 {
+		t.Fatalf("range requests = %v, want 2 chunks", ranges)
 	}
 	// 偏移必须按解码后的原始字节推进（按 base64 文本推进会跳内容）
 	if ranges[1][0] != attachmentChunkSize {
@@ -152,7 +152,7 @@ func TestDownloadAttachmentRangeIgnoredDecodesWhole(t *testing.T) {
 	}}
 	got, err := engine.downloadAttachment(context.Background(), eas.Attachment{
 		FileReference:     "large",
-		EstimatedDataSize: 2*attachmentChunkSize + 1,
+		EstimatedDataSize: attachmentChunkSize + 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -486,12 +486,117 @@ func TestAttachmentMissingRefreshesFileReferenceAndRetries(t *testing.T) {
 	if got := cached.Item.Attachments[0].FileReference; got != "new-ref" {
 		t.Fatalf("cached refreshed FileReference = %q, want new-ref", got)
 	}
+	st.mu.Lock()
+	inMemoryReference := st.Items["inbox"][0].Attachments[0].FileReference
+	st.mu.Unlock()
+	if inMemoryReference != "new-ref" {
+		t.Fatalf("in-memory refreshed FileReference = %q, want new-ref", inMemoryReference)
+	}
 	refreshedData, err := os.ReadFile(attachmentCachePath("inbox", "message", "new-ref"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(refreshedData, payload) {
 		t.Fatalf("refreshed attachment cache = %q, want %q", refreshedData, payload)
+	}
+}
+
+func TestAttachmentRefreshRepeatsAfterBackoff(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st := mustLoadTestState(t)
+	oldMeta := eas.Attachment{
+		FileReference:     "old-ref",
+		DisplayName:       "report.pdf",
+		ContentType:       "application/pdf",
+		EstimatedDataSize: 7,
+	}
+	midMeta := oldMeta
+	midMeta.FileReference = "mid-ref"
+	newMeta := oldMeta
+	newMeta.FileReference = "new-ref"
+	st.Folders = []eas.Folder{{ServerID: "inbox", Type: eas.FolderTypeInbox}}
+	st.Items["inbox"] = []eas.EmailItem{{
+		ServerID:       "message",
+		BodyType:       eas.BodyTypePlain,
+		Body:           "summary",
+		HasAttachments: true,
+		Attachments:    []eas.Attachment{oldMeta},
+	}}
+
+	payload := []byte("PDFDATA")
+	htmlCalls := 0
+	var refs []string
+	engine := &syncEngine{
+		st: st,
+		c: &easmock.Client{
+			EmailClient: easmock.EmailClient{
+				FetchEmailFunc: func(_ context.Context, _, serverID string, opts eas.FetchEmailOptions) (*eas.EmailItem, error) {
+					switch opts.BodyType {
+					case eas.BodyTypeMIME:
+						return &eas.EmailItem{ServerID: serverID}, nil
+					case eas.BodyTypeHTML:
+						htmlCalls++
+						meta := midMeta
+						if htmlCalls > 1 {
+							meta = newMeta
+						}
+						return &eas.EmailItem{
+							ServerID:       serverID,
+							BodyType:       eas.BodyTypeHTML,
+							Body:           "<p>complete</p>",
+							HasAttachments: true,
+							Attachments:    []eas.Attachment{meta},
+						}, nil
+					case eas.BodyTypePlain:
+						return &eas.EmailItem{ServerID: serverID, BodyType: eas.BodyTypePlain, Body: "complete"}, nil
+					default:
+						return nil, nil
+					}
+				},
+			},
+			FolderClient: easmock.FolderClient{
+				FetchAttachmentFunc: func(_ context.Context, ref string, _, _ int64) (*eas.FetchAttachmentResult, error) {
+					refs = append(refs, ref)
+					if ref != newMeta.FileReference {
+						return nil, eas.ErrAttachmentDataMissing
+					}
+					return &eas.FetchAttachmentResult{
+						Data: []byte(base64.StdEncoding.EncodeToString(payload)),
+					}, nil
+				},
+			},
+		},
+	}
+
+	if _, err := engine.fetchAttachmentCached(context.Background(), "inbox", "message", oldMeta); !isAttachmentNoDataError(err) {
+		t.Fatalf("first refresh error = %v, want missing attachment data", err)
+	}
+	key := "attachment:inbox\x00message\x00old-ref"
+	engine.attachmentBackoffMu.Lock()
+	backoff := engine.attachmentBackoff[key]
+	if backoff.refreshed {
+		engine.attachmentBackoffMu.Unlock()
+		t.Fatal("backoff step did not re-enable metadata refresh")
+	}
+	backoff.nextRetry = time.Now().Add(-time.Second)
+	engine.attachmentBackoff[key] = backoff
+	engine.attachmentBackoffMu.Unlock()
+
+	got, err := engine.fetchAttachmentCached(context.Background(), "inbox", "message", oldMeta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("payload = %q, want %q", got, payload)
+	}
+	if gotRefs := fmt.Sprint(refs); gotRefs != "[old-ref mid-ref old-ref new-ref]" {
+		t.Fatalf("attachment references = %s, want two metadata refresh rounds", gotRefs)
+	}
+	st.mu.Lock()
+	inMemoryReference := st.Items["inbox"][0].Attachments[0].FileReference
+	st.mu.Unlock()
+	if inMemoryReference != "new-ref" {
+		t.Fatalf("in-memory FileReference = %q, want new-ref", inMemoryReference)
 	}
 }
 

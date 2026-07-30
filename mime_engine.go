@@ -406,16 +406,35 @@ func (e *syncEngine) refreshAttachmentMetadata(
 			log.Printf("[mime] 写刷新后的原始 MIME 缓存失败: %v", err)
 		}
 	}
-	refreshed, matched := findRefreshedAttachment(previous, source.Item.Attachments)
-	changed := matched && refreshed.FileReference != "" && refreshed.FileReference != previous.FileReference
+	// The caller may still hold a plan built with an older FileReference while
+	// the in-memory summary already contains the successor found by an earlier
+	// refresh. Match against that current successor so another server-side
+	// rotation can be discovered after the next backoff step.
+	matchBase := previous
+	summaryHasPrevious := false
+	for _, attachment := range summary.Attachments {
+		if attachment.FileReference == previous.FileReference {
+			summaryHasPrevious = true
+			break
+		}
+	}
+	if !summaryHasPrevious {
+		if current, ok := findRefreshedAttachment(previous, summary.Attachments); ok {
+			matchBase = current
+		}
+	}
+	refreshed, matched := findRefreshedAttachment(matchBase, source.Item.Attachments)
+	changed := matched && refreshed.FileReference != "" && refreshed.FileReference != matchBase.FileReference
 	if changed {
 		attachments := make([]eas.Attachment, 0, len(source.Item.Attachments))
 		for _, attachment := range source.Item.Attachments {
-			if attachment.FileReference != previous.FileReference {
+			if attachment.FileReference != previous.FileReference &&
+				attachment.FileReference != matchBase.FileReference {
 				attachments = append(attachments, attachment)
 			}
 		}
 		source.Item.Attachments = attachments
+		e.updateCachedAttachmentMetadata(folderID, serverID, matchBase, refreshed)
 	}
 	if source.Complete && len(source.RawMIME) == 0 {
 		metadata, err := json.Marshal(cachedMessageMetadata{Item: source.Item, PlainBody: source.PlainBody})
@@ -430,6 +449,30 @@ func (e *syncEngine) refreshAttachmentMetadata(
 		return eas.Attachment{}, false, nil
 	}
 	return refreshed, true, nil
+}
+
+func (e *syncEngine) updateCachedAttachmentMetadata(
+	folderID, serverID string,
+	previous, refreshed eas.Attachment,
+) {
+	e.st.mu.Lock()
+	defer e.st.mu.Unlock()
+	items := e.st.Items[folderID]
+	for itemIndex := range items {
+		if items[itemIndex].ServerID != serverID {
+			continue
+		}
+		for attachmentIndex := range items[itemIndex].Attachments {
+			if items[itemIndex].Attachments[attachmentIndex].FileReference != previous.FileReference {
+				continue
+			}
+			items[itemIndex].Attachments[attachmentIndex] = mergeAttachmentMetadata(
+				items[itemIndex].Attachments[attachmentIndex],
+				refreshed,
+			)
+			return
+		}
+	}
 }
 
 func findRefreshedAttachment(previous eas.Attachment, candidates []eas.Attachment) (eas.Attachment, bool) {
@@ -478,6 +521,10 @@ func (e *syncEngine) trackAttachmentFailure(key string, err error) {
 	step := attachmentBackoffSteps[min(state.failures, len(attachmentBackoffSteps))-1]
 	state.nextRetry = time.Now().Add(step)
 	state.cause = err
+	// One metadata refresh is allowed per remote attempt. Reset after entering
+	// a backoff step so a second FileReference rotation can be discovered when
+	// the next retry becomes eligible.
+	state.refreshed = false
 	if e.attachmentBackoff == nil {
 		e.attachmentBackoff = map[string]attachmentBackoff{}
 	}
@@ -520,7 +567,7 @@ func (e *syncEngine) clearAttachmentBackoffsForMessage(folderID, serverID string
 // fork 库保持上游语义：FetchAttachment 的 Data 是未解码的 base64 原文，
 // 解码统一在本函数内完成（缓存与下游拿到的都是原始字节）。
 func (e *syncEngine) downloadAttachment(ctx context.Context, meta eas.Attachment) ([]byte, error) {
-	if meta.EstimatedDataSize <= 2*attachmentChunkSize {
+	if meta.EstimatedDataSize <= attachmentChunkSize {
 		result, err := e.c.FetchAttachment(ctx, meta.FileReference, 0, 0)
 		if err != nil {
 			return nil, err

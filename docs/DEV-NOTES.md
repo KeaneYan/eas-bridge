@@ -70,6 +70,7 @@ IMAP COPY 用 MoveItems 实现（移动语义，与 DavMail 一致）；APPEND �
 ### FetchAttachment 的 Data 是未解码 base64 原文，调用方必须解码（2026-07-25 图片全挂事故）
 fork 保持上游语义不解码（FORK-NOTES）。eas-bridge 曾直接用 `got.Data` 构建 MIME → `writeBase64` 二次编码 → 双层 base64，Apple Mail 解一层后拿到 `iVBORw0K...` 文本，**所有图片/附件全坏**。修复：解码收拢进 `downloadAttachment`（尺寸引导 `decodeAttachmentData`，与 webank-mail 逐字节一致）。
 **分块路径两个叠加坑**（ZCode B-1/H-1）：① 每块的 Data 是**独立** base64 编码各自带 padding（4MB 不被 3 整除，中间块必有 `==`），拼接后整体解码必然在中间 padding 处失败；② Range 作用于**原始字节**（MS-ASCMD：附件 range applies to the file content），偏移必须按**解码后**长度推进，按 base64 文本长度推进会跳 ~1/3 内容。正确姿势：逐块 `decodeBase64Chunk` → 拼接原始字节。
+超过 4 MiB 的附件直接走 Range 分块，避免弱网或代理链路下单个大响应反复撞 EAS HTTP 2 分钟超时。
 **改 MIME 构建后必须 bump `mimeCacheVersion`**——已污染的 .eml/.bin 缓存不会自愈。
 
 ### Status 5 风暴必须退避，不能每分钟全量重拉（2026-07-25 凌晨 6 小时事故）
@@ -102,9 +103,10 @@ SIGTERM 后继续访问 EAS/state。缓存修剪同样要在 ctx 取消后停止
 ### FetchAttachment 明确无数据时要退避
 Coremail 偶尔会为已声明的 FileReference 返回成功响应但不含 Data。Apple Mail 会重复
 请求同一个 MIME part；如果每次都直打 EAS，会形成每分钟一次的无效下载。只对
-`FetchAttachment: no data in response` 做纯内存 1m→5m→15m→1h→6h→24h 退避；第一次
-缺失先重新 Fetch 邮件元数据，若 FileReference 已轮换则立即用新引用重试。普通网络错误
-仍立即重试，成功后清除退避，且任何失败都不得写入附件缓存。
+`FetchAttachment: no data in response` 做纯内存 1m→5m→15m→1h→6h→24h 退避；每次
+退避到期后的远端重试都可重新 Fetch 邮件元数据，若 FileReference 已轮换则立即用新引用
+重试并同步更新内存摘要。普通网络错误仍立即重试，成功后清除退避，且任何失败都不得写入
+附件缓存。
 
 附件数据缺失不能让 BODYSTRUCTURE / RFC822.SIZE 失败。未知尺寸附件估算时把缺失内容按空
 数据处理，只影响实际打开/保存该附件；Apple Mail 重复请求同一退避中的 part 时，go-imap

@@ -135,8 +135,9 @@ func (d *imapd) Serve(addr string) error {
 	srv := imapserver.New(&imapserver.Options{
 		NewSession: func(conn *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
 			ctx, cancel := context.WithCancel(context.Background())
+			session := &imapSession{d: d, conn: conn, ctx: ctx, cancel: cancel, counted: true}
 			d.sessionOpened()
-			return &imapSession{d: d, conn: conn, ctx: ctx, cancel: cancel, counted: true}, &imapserver.GreetingData{}, nil
+			return session, &imapserver.GreetingData{}, nil
 		},
 		InsecureAuth: true, // 仅 localhost 监听，无需 TLS
 		Logger:       &imapServerLogger{},
