@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"mime"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -56,6 +58,169 @@ func TestMessagePlanMetadataDoesNotDownloadKnownAttachments(t *testing.T) {
 	}
 	if attachmentCalls != 0 {
 		t.Fatalf("metadata fetch downloaded %d attachments", attachmentCalls)
+	}
+}
+
+func TestBodyStructureEncodesNonASCIIAttachmentNames(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	engine := &syncEngine{c: &easmock.Client{
+		FolderClient: easmock.FolderClient{
+			FetchAttachmentFunc: func(context.Context, string, int64, int64) (*eas.FetchAttachmentResult, error) {
+				return &eas.FetchAttachmentResult{Data: []byte("unexpected")}, nil
+			},
+		},
+	}}
+	const filename = "8月12日沙龙海报的.png"
+	plan := newMessagePlan("folder", "message", eas.EmailItem{
+		ServerID: "message",
+		BodyType: eas.BodyTypeHTML,
+		Body:     "<p>message</p>",
+		Attachments: []eas.Attachment{{
+			FileReference:     "ref",
+			DisplayName:       filename,
+			EstimatedDataSize: 128,
+		}},
+	}, "message")
+
+	structure, err := plan.bodyStructure(context.Background(), engine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	structure.Walk(func(_ []int, part imap.BodyStructure) bool {
+		single, ok := part.(*imap.BodyStructureSinglePart)
+		if !ok {
+			return true
+		}
+		if name := single.Params["name"]; name != "" {
+			names = append(names, name)
+		}
+		if single.Extended != nil && single.Extended.Disposition != nil {
+			if fn := single.Extended.Disposition.Params["filename"]; fn != "" {
+				names = append(names, fn)
+			}
+		}
+		return true
+	})
+	if len(names) == 0 {
+		t.Fatal("attachment name/filename params missing from BODYSTRUCTURE")
+	}
+	decoder := new(mime.WordDecoder)
+	for _, name := range names {
+		for i := 0; i < len(name); i++ {
+			if name[i] > 127 {
+				t.Fatalf("param %q contains raw non-ASCII bytes (Apple Mail mis-decodes these as Latin-1)", name)
+			}
+		}
+		decoded, err := decoder.DecodeHeader(name)
+		if err != nil {
+			t.Fatalf("param %q is not a decodable encoded-word: %v", name, err)
+		}
+		if decoded != filename {
+			t.Fatalf("decoded param = %q, want %q", decoded, filename)
+		}
+	}
+}
+
+func TestBodyStructureEncodesRawMIMENestedAttachmentNames(t *testing.T) {
+	// raw MIME 透传路径（plan.rawMIME 非空）+ message/rfc822 嵌套：
+	// go-imap 的 Walk 不递归嵌套体，但序列化端会原样写出——嵌套里的
+	// 中文附件名也必须 encoded-word 化，否则 Apple Mail 同样乱码。
+	raw := "From: a@b.com\r\n" +
+		"To: c@d.com\r\n" +
+		"Subject: test\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: multipart/mixed; boundary=BB\r\n" +
+		"\r\n" +
+		"--BB\r\n" +
+		"Content-Type: text/plain\r\n" +
+		"\r\n" +
+		"hello\r\n" +
+		"--BB\r\n" +
+		"Content-Type: application/pdf; name*=utf-8''%E6%8A%A5%E5%90%8D%E8%A1%A8.pdf\r\n" +
+		"Content-Disposition: attachment; filename*=utf-8''%E6%8A%A5%E5%90%8D%E8%A1%A8.pdf\r\n" +
+		"Content-Transfer-Encoding: base64\r\n" +
+		"\r\n" +
+		"aGVsbG8=\r\n" +
+		"--BB\r\n" +
+		"Content-Type: message/rfc822\r\n" +
+		"\r\n" +
+		"From: e@f.com\r\n" +
+		"Subject: inner\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: multipart/mixed; boundary=CC\r\n" +
+		"\r\n" +
+		"--CC\r\n" +
+		"Content-Type: text/plain\r\n" +
+		"\r\n" +
+		"inner body\r\n" +
+		"--CC\r\n" +
+		"Content-Type: image/png; name*=utf-8''%E8%B6%B3%E7%90%83.png\r\n" +
+		"Content-Disposition: attachment; filename*=utf-8''%E8%B6%B3%E7%90%83.png\r\n" +
+		"Content-Transfer-Encoding: base64\r\n" +
+		"\r\n" +
+		"aGVsbG8=\r\n" +
+		"--CC--\r\n" +
+		"--BB--\r\n"
+	plan := &messagePlan{rawMIME: []byte(raw)}
+
+	structure, err := plan.bodyStructure(context.Background(), &syncEngine{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if structure == nil {
+		t.Fatal("nil BODYSTRUCTURE")
+	}
+	var params, descriptions []string
+	var collect func(bs imap.BodyStructure)
+	collect = func(bs imap.BodyStructure) {
+		bs.Walk(func(_ []int, part imap.BodyStructure) bool {
+			single, ok := part.(*imap.BodyStructureSinglePart)
+			if !ok {
+				return true
+			}
+			for _, v := range single.Params {
+				params = append(params, v)
+			}
+			if single.Description != "" {
+				descriptions = append(descriptions, single.Description)
+			}
+			if msg := single.MessageRFC822; msg != nil && msg.BodyStructure != nil {
+				collect(msg.BodyStructure)
+			}
+			if single.Extended != nil && single.Extended.Disposition != nil {
+				for _, v := range single.Extended.Disposition.Params {
+					params = append(params, v)
+				}
+			}
+			return true
+		})
+	}
+	collect(structure)
+	decoder := new(mime.WordDecoder)
+	assertClean := func(value string) {
+		t.Helper()
+		for i := 0; i < len(value); i++ {
+			if value[i] > 127 {
+				t.Fatalf("value %q contains raw non-ASCII bytes (Apple Mail mis-decodes these as Latin-1)", value)
+			}
+		}
+	}
+	var decodedNames []string
+	for _, v := range params {
+		assertClean(v)
+		if d, err := decoder.DecodeHeader(v); err == nil && strings.ContainsAny(d, "足报名") {
+			decodedNames = append(decodedNames, d)
+		}
+	}
+	for _, v := range descriptions {
+		assertClean(v)
+	}
+	if !strings.Contains(strings.Join(decodedNames, ","), "足球.png") {
+		t.Fatalf("nested message/rfc822 attachment name lost or undecodable, got %v", decodedNames)
+	}
+	if !strings.Contains(strings.Join(decodedNames, ","), "报名表.pdf") {
+		t.Fatalf("top-level attachment name lost or undecodable, got %v", decodedNames)
 	}
 }
 

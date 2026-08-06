@@ -112,6 +112,18 @@ Coremail 偶尔会为已声明的 FileReference 返回成功响应但不含 Data
 数据处理，只影响实际打开/保存该附件；Apple Mail 重复请求同一退避中的 part 时，go-imap
 错误日志最多每小时记录一次。
 
+### BODYSTRUCTURE 非 ASCII 参数必须以 encoded-word 落 wire（2026-08-06 附件名乱码）
+症状：Apple Mail 里中文附件名显示为 `8æ12æ¥...png`（UTF-8 按 Latin-1 误读）。根因链：
+MIME 里的 RFC 2231 参数（`name*=utf-8''...`）被 `imapserver.ExtractBodyStructure` 解码成
+Unicode Go 字符串，go-imap 服务端序列化（imapwire encoder）对非 ASCII 一律裸字节落 wire
+（quoted 或 literal，永不自发走 RFC 2047），编码信息丢失，Apple Mail 按 Latin-1 解读。
+修复：`bodyStructure()` 出口统一过 `encodeBodyStructureParams`（mime_engine.go），把非 ASCII
+的 name/filename/Description 重编码为 RFC 2047 encoded-word（Dovecot 对非 ASCII 参数的同款
+做法）。**go-imap 的 `Walk` 不递归 message/rfc822 嵌套体**（`BodyStructureSinglePart.Walk`
+只回调自身），但序列化端原样写出嵌套结构——转发邮件/.eml 附件里的中文名必须显式递归处理；
+multipart 的 `Extended.Params`、single part 的 `Description` 同型。此类 bug 影响 IMAP 响应
+而非缓存产物，**不需要 bump mimeCacheVersion**，客户端重取 BODYSTRUCTURE 即自愈。
+
 ## 三、架构不变量
 
 1. **IMAP UID 1-based 单调递增、持久化**（serverID↔UID 双向映射 + folderMeta.NextUID/UIDValidity）；UIDVALIDITY 恒定，state 重置才 bump（客户端会全量重下）。

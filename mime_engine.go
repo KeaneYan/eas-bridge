@@ -172,7 +172,11 @@ func (e *syncEngine) cachedEmailItem(folderID, serverID string) (eas.EmailItem, 
 
 func (plan *messagePlan) bodyStructure(ctx context.Context, engine *syncEngine) (imap.BodyStructure, error) {
 	if len(plan.rawMIME) > 0 {
-		return imapserver.ExtractBodyStructure(bytes.NewReader(plan.rawMIME)), nil
+		structure := imapserver.ExtractBodyStructure(bytes.NewReader(plan.rawMIME))
+		if structure != nil {
+			encodeBodyStructureParams(structure)
+		}
+		return structure, nil
 	}
 	skeleton, err := plan.estimatedMIME(ctx, engine)
 	if err != nil {
@@ -182,7 +186,50 @@ func (plan *messagePlan) bodyStructure(ctx context.Context, engine *syncEngine) 
 	if structure == nil {
 		return nil, errors.New("无法解析邮件 BODYSTRUCTURE")
 	}
+	encodeBodyStructureParams(structure)
 	return structure, nil
+}
+
+// encodeBodyStructureParams 把 BODYSTRUCTURE 里非 ASCII 的参数值（中文附件名
+// 的 name/filename）重新编码为 RFC 2047 encoded-word。ExtractBodyStructure 会
+// 把 MIME 里的 RFC 2231 参数（name*=utf-8''...）解码成 Unicode 字符串，而
+// go-imap 服务端序列化非 ASCII 参数时按字面 literal 输出裸 UTF-8 字节——编码
+// 信息丢失，Apple Mail 按 Latin-1 解读导致附件名乱码。改发 encoded-word 与
+// Dovecot 对非 ASCII 参数的处理一致，主流客户端都会解码。
+func encodeBodyStructureParams(structure imap.BodyStructure) {
+	structure.Walk(func(_ []int, part imap.BodyStructure) bool {
+		switch p := part.(type) {
+		case *imap.BodyStructureSinglePart:
+			encodeNonASCIIParams(p.Params)
+			p.Description = encodeHeaderWord(p.Description)
+			if msg := p.MessageRFC822; msg != nil && msg.BodyStructure != nil {
+				// go-imap 的 Walk 不递归 message/rfc822 嵌套体（fetch.go
+				// BodyStructureSinglePart.Walk 只回调自身），但序列化端
+				// writeBodyType1part 会原样写出嵌套结构——转发邮件/.eml
+				// 附件里的中文附件名必须显式递归处理。
+				encodeBodyStructureParams(msg.BodyStructure)
+			}
+			if p.Extended != nil && p.Extended.Disposition != nil {
+				encodeNonASCIIParams(p.Extended.Disposition.Params)
+			}
+		case *imap.BodyStructureMultiPart:
+			if p.Extended != nil {
+				encodeNonASCIIParams(p.Extended.Params)
+				if p.Extended.Disposition != nil {
+					encodeNonASCIIParams(p.Extended.Disposition.Params)
+				}
+			}
+		}
+		return true
+	})
+}
+
+func encodeNonASCIIParams(params map[string]string) {
+	for key, value := range params {
+		if encoded := encodeHeaderWord(value); encoded != value {
+			params[key] = encoded
+		}
+	}
 }
 
 func (plan *messagePlan) estimatedRFC822Size(ctx context.Context, engine *syncEngine) (int64, error) {
